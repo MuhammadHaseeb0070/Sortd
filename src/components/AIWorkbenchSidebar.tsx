@@ -73,13 +73,15 @@ export default function AIWorkbenchSidebar({
   const activeProfile = getProfile(activeProfileId);
   const activeTools = getActiveToolsForProfile(activeProfileId);
 
-  // Settings & BYOK
+  // Settings & BYOK / Pro Admin
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
   const [modelConfig, setModelConfig] = useState<ModelConfig>({
     provider: 'openrouter',
-    model: 'google/gemini-2.5-flash',
+    model: 'anthropic/claude-haiku-5.5',
     apiKey: '',
+    adminPassword: '',
   });
+  const [adminPasswordInput, setAdminPasswordInput] = useState('');
 
   // Radar Telemetry Strip
   const [radar, setRadar] = useState<WorkbookRadar | null>(null);
@@ -150,7 +152,15 @@ export default function AIWorkbenchSidebar({
     try {
       const savedConfig = localStorage.getItem('sortd_model_config');
       if (savedConfig) {
-        setModelConfig(JSON.parse(savedConfig));
+        const parsed = JSON.parse(savedConfig);
+        // Default to claude-haiku-5.5 if unset or previous gemini default
+        if (!parsed.model || parsed.model === 'google/gemini-2.5-flash') {
+          parsed.model = 'anthropic/claude-haiku-5.5';
+        }
+        setModelConfig(parsed);
+        if (parsed.adminPassword) {
+          setAdminPasswordInput(parsed.adminPassword);
+        }
       }
       const savedGate = localStorage.getItem('sortd_require_confirmation');
       if (savedGate !== null) {
@@ -175,9 +185,14 @@ export default function AIWorkbenchSidebar({
 
   // Save Settings to localStorage
   const handleSaveSettings = (newConfig: ModelConfig) => {
-    setModelConfig(newConfig);
+    const updated: ModelConfig = {
+      ...newConfig,
+      model: newConfig.model?.trim() || 'anthropic/claude-haiku-5.5',
+      adminPassword: adminPasswordInput.trim(),
+    };
+    setModelConfig(updated);
     try {
-      localStorage.setItem('sortd_model_config', JSON.stringify(newConfig));
+      localStorage.setItem('sortd_model_config', JSON.stringify(updated));
     } catch {
       // ignore
     }
@@ -1078,6 +1093,11 @@ export default function AIWorkbenchSidebar({
           </div>
 
           <div className="flex items-center space-x-1.5 text-slate-400 text-[10px]">
+            {modelConfig.adminPassword === 'sortd2026' && (
+              <span className="px-1.5 py-0.2 rounded bg-emerald-50 border border-emerald-300 text-emerald-800 font-semibold text-[9.5px]">
+                PRO
+              </span>
+            )}
             <span>Model:</span>
             <span className="text-slate-600 font-medium truncate max-w-[130px]">
               {modelConfig.model.split('/').pop()}
@@ -1146,18 +1166,147 @@ export default function AIWorkbenchSidebar({
               <div className="flex items-center space-x-2">
                 <Settings2 className="h-4 w-4 text-emerald-600" />
                 <h3 className="font-semibold text-slate-900 text-sm">
-                  Workbench Settings &amp; BYOK
+                  Workbench Settings
                 </h3>
               </div>
-              <button
-                onClick={() => setIsSettingsOpen(false)}
-                className="p-1 rounded-md text-slate-400 hover:text-slate-700 hover:bg-slate-100"
-              >
-                <X className="h-4 w-4" />
-              </button>
+              <div className="flex items-center space-x-2">
+                {adminPasswordInput.trim() === 'sortd2026' ? (
+                  <span className="px-2 py-0.5 rounded-full bg-emerald-50 border border-emerald-200 text-emerald-700 font-medium text-[10px] flex items-center gap-1">
+                    <ShieldCheck className="h-3 w-3 text-emerald-600" /> Pro Admin
+                  </span>
+                ) : (
+                  <span className="px-2 py-0.5 rounded-full bg-slate-100 text-slate-500 font-medium text-[10px]">
+                    Standard Mode
+                  </span>
+                )}
+                <button
+                  onClick={() => setIsSettingsOpen(false)}
+                  className="p-1 rounded-md text-slate-400 hover:text-slate-700 hover:bg-slate-100 cursor-pointer"
+                >
+                  <X className="h-4 w-4" />
+                </button>
+              </div>
             </div>
 
             <div className="space-y-3.5">
+              {/* Pro User / Admin Access Section */}
+              <div className="rounded-xl border border-emerald-200/80 bg-emerald-50/40 p-3 space-y-2">
+                <div className="flex items-center justify-between">
+                  <div className="flex items-center space-x-1.5">
+                    <ShieldCheck className="h-4 w-4 text-emerald-600" />
+                    <span className="font-semibold text-slate-800 text-xs">Pro User / Admin Access</span>
+                  </div>
+                  {adminPasswordInput.trim() === 'sortd2026' && (
+                    <span className="text-[10px] font-semibold text-emerald-700 flex items-center gap-0.5">
+                      <Check className="h-3 w-3" /> Unlocked
+                    </span>
+                  )}
+                </div>
+
+                <p className="text-[11px] text-slate-600 leading-relaxed">
+                  Enter the admin password to use the built-in managed AI key (Claude Haiku 5.5). No personal API key required!
+                </p>
+
+                <div className="space-y-1">
+                  <input
+                    type="password"
+                    value={adminPasswordInput}
+                    onChange={(e) => setAdminPasswordInput(e.target.value)}
+                    placeholder="Enter password (e.g. sortd2026)"
+                    className="w-full bg-white border border-slate-200 rounded-lg px-2.5 py-1.5 text-slate-800 text-[11px] focus:outline-none focus:border-emerald-500 font-mono"
+                  />
+                  {adminPasswordInput.trim() === 'sortd2026' ? (
+                    <p className="text-[10.5px] text-emerald-700 font-medium flex items-center gap-1 pt-0.5">
+                      <Check className="h-3 w-3" /> Admin access confirmed. Managed key active.
+                    </p>
+                  ) : adminPasswordInput.trim().length > 0 ? (
+                    <p className="text-[10.5px] text-amber-600 pt-0.5">
+                      Incorrect password. Please enter sortd2026 or use personal API key below.
+                    </p>
+                  ) : null}
+                </div>
+              </div>
+
+              {/* Model Identifier */}
+              <div>
+                <div className="flex items-center justify-between mb-1">
+                  <label className="text-slate-700 font-medium">Model Identifier</label>
+                  <button
+                    type="button"
+                    onClick={() => setModelConfig({ ...modelConfig, model: 'anthropic/claude-haiku-5.5' })}
+                    className="text-[10px] text-emerald-600 hover:text-emerald-700 hover:underline cursor-pointer"
+                  >
+                    Reset Default (Haiku 5.5)
+                  </button>
+                </div>
+                <input
+                  type="text"
+                  value={modelConfig.model}
+                  onChange={(e) => setModelConfig({ ...modelConfig, model: e.target.value })}
+                  placeholder="e.g. anthropic/claude-haiku-5.5"
+                  className="w-full bg-slate-50 border border-slate-200 rounded-lg px-2.5 py-1.5 text-slate-800 font-mono text-[11px] focus:outline-none focus:border-slate-400"
+                />
+                <div className="flex flex-wrap gap-1 mt-1.5">
+                  <button
+                    type="button"
+                    onClick={() => setModelConfig({ ...modelConfig, model: 'anthropic/claude-haiku-5.5' })}
+                    className={`px-1.5 py-0.5 text-[9.5px] rounded border cursor-pointer ${
+                      modelConfig.model === 'anthropic/claude-haiku-5.5'
+                        ? 'bg-emerald-50 border-emerald-300 text-emerald-800 font-medium'
+                        : 'bg-slate-50 border-slate-200 text-slate-600 hover:bg-slate-100'
+                    }`}
+                  >
+                    Claude Haiku 5.5 (Default)
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setModelConfig({ ...modelConfig, model: 'anthropic/claude-3.5-haiku' })}
+                    className={`px-1.5 py-0.5 text-[9.5px] rounded border cursor-pointer ${
+                      modelConfig.model === 'anthropic/claude-3.5-haiku'
+                        ? 'bg-emerald-50 border-emerald-300 text-emerald-800 font-medium'
+                        : 'bg-slate-50 border-slate-200 text-slate-600 hover:bg-slate-100'
+                    }`}
+                  >
+                    Claude 3.5 Haiku
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setModelConfig({ ...modelConfig, model: 'google/gemini-2.5-flash' })}
+                    className={`px-1.5 py-0.5 text-[9.5px] rounded border cursor-pointer ${
+                      modelConfig.model === 'google/gemini-2.5-flash'
+                        ? 'bg-emerald-50 border-emerald-300 text-emerald-800 font-medium'
+                        : 'bg-slate-50 border-slate-200 text-slate-600 hover:bg-slate-100'
+                    }`}
+                  >
+                    Gemini 2.5 Flash
+                  </button>
+                </div>
+              </div>
+
+              {/* Personal API Key (BYOK) */}
+              <div>
+                <label className="text-slate-700 block mb-1 font-medium flex items-center justify-between">
+                  <span>Personal API Key (BYOK)</span>
+                  <span className="text-[10px] text-slate-400 font-normal">
+                    {adminPasswordInput.trim() === 'sortd2026'
+                      ? 'Optional in Pro Admin mode'
+                      : 'Stored in local browser storage only'}
+                  </span>
+                </label>
+                <input
+                  type="password"
+                  value={modelConfig.apiKey || ''}
+                  onChange={(e) => setModelConfig({ ...modelConfig, apiKey: e.target.value })}
+                  placeholder={
+                    adminPasswordInput.trim() === 'sortd2026'
+                      ? 'Managed key active (optional custom override)'
+                      : 'sk-or-v1-... or sk-...'
+                  }
+                  className="w-full bg-slate-50 border border-slate-200 rounded-lg px-2.5 py-1.5 text-slate-800 font-mono text-[11px] focus:outline-none focus:border-slate-400"
+                />
+              </div>
+
+              {/* Provider Endpoint */}
               <div>
                 <label className="text-slate-700 block mb-1 font-medium">Provider Endpoint</label>
                 <select
@@ -1168,38 +1317,11 @@ export default function AIWorkbenchSidebar({
                   className="w-full bg-slate-50 border border-slate-200 rounded-lg px-2.5 py-1.5 text-slate-800 focus:outline-none focus:border-slate-400"
                 >
                   <option value="openrouter">
-                    OpenRouter (Default · Gemini, Claude, Llama, DeepSeek)
+                    OpenRouter (Default · Haiku, Claude, Gemini, Llama)
                   </option>
                   <option value="openai">OpenAI Official</option>
                   <option value="custom">Custom Compatible Base URL</option>
                 </select>
-              </div>
-
-              <div>
-                <label className="text-slate-700 block mb-1 font-medium">Model Identifier</label>
-                <input
-                  type="text"
-                  value={modelConfig.model}
-                  onChange={(e) => setModelConfig({ ...modelConfig, model: e.target.value })}
-                  placeholder="e.g. google/gemini-2.5-flash, anthropic/claude-3.7-sonnet"
-                  className="w-full bg-slate-50 border border-slate-200 rounded-lg px-2.5 py-1.5 text-slate-800 font-mono text-[11px] focus:outline-none focus:border-slate-400"
-                />
-              </div>
-
-              <div>
-                <label className="text-slate-700 block mb-1 font-medium flex items-center justify-between">
-                  <span>API Key (BYOK)</span>
-                  <span className="text-[10px] text-slate-400 font-normal">
-                    Stored in local browser storage only
-                  </span>
-                </label>
-                <input
-                  type="password"
-                  value={modelConfig.apiKey || ''}
-                  onChange={(e) => setModelConfig({ ...modelConfig, apiKey: e.target.value })}
-                  placeholder="sk-or-v1-... or sk-..."
-                  className="w-full bg-slate-50 border border-slate-200 rounded-lg px-2.5 py-1.5 text-slate-800 font-mono text-[11px] focus:outline-none focus:border-slate-400"
-                />
               </div>
 
               {modelConfig.provider === 'custom' && (
@@ -1219,13 +1341,13 @@ export default function AIWorkbenchSidebar({
             <div className="flex justify-end space-x-2 pt-3 border-t border-slate-100">
               <button
                 onClick={() => setIsSettingsOpen(false)}
-                className="px-3 py-1.5 rounded-lg bg-slate-100 hover:bg-slate-200 text-slate-700 text-xs font-medium"
+                className="px-3 py-1.5 rounded-lg bg-slate-100 hover:bg-slate-200 text-slate-700 text-xs font-medium cursor-pointer"
               >
                 Cancel
               </button>
               <button
                 onClick={() => handleSaveSettings(modelConfig)}
-                className="px-3.5 py-1.5 rounded-lg bg-slate-900 hover:bg-slate-800 text-white font-medium text-xs shadow-2xs"
+                className="px-3.5 py-1.5 rounded-lg bg-slate-900 hover:bg-slate-800 text-white font-medium text-xs shadow-2xs cursor-pointer"
               >
                 Save Settings
               </button>

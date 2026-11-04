@@ -270,6 +270,7 @@ export interface ModelConfig {
   provider: 'openrouter' | 'openai' | 'custom';
   model: string;
   apiKey?: string;
+  adminPassword?: string;
   baseUrl?: string;
   temperature?: number;
 }
