@@ -10,6 +10,19 @@ const EXPECTED_ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || 'sortd2026';
 export async function POST(req: NextRequest) {
   try {
     const body = await req.json();
+
+    // Verification endpoint for admin password check
+    if (body.action === 'verify_admin') {
+      const isMatch = (body.password || '').trim() === EXPECTED_ADMIN_PASSWORD;
+      if (isMatch) {
+        return NextResponse.json({ verified: true });
+      }
+      return NextResponse.json(
+        { verified: false, error: 'Incorrect admin password.' },
+        { status: 401 }
+      );
+    }
+
     const { messages, systemPrompt, tools, modelConfig } = body;
 
     const provider = modelConfig?.provider || 'openrouter';
@@ -37,7 +50,7 @@ export async function POST(req: NextRequest) {
       return NextResponse.json(
         {
           error:
-            'No valid API key or Admin password provided. Please configure your OpenRouter / OpenAI API key in Workbench Settings (Gear icon) or enter the Pro Admin password (sortd2026).',
+            'No valid API key or Admin credentials provided. Please configure your API key in Workbench Settings or enter the Admin password.',
         },
         { status: 401 }
       );

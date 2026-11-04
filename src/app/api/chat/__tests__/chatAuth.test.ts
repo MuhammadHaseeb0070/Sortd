@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { NextRequest } from 'next/server';
 import { POST } from '../route';
 
-test('Chat API Auth: rejects requests without API key or Admin password', async () => {
+test('Chat API Auth: rejects requests without API key or Admin password with no password hint', async () => {
   const req = new NextRequest('http://localhost:3000/api/chat', {
     method: 'POST',
     body: JSON.stringify({
@@ -19,6 +19,35 @@ test('Chat API Auth: rejects requests without API key or Admin password', async 
   assert.equal(res.status, 401);
   const data = await res.json();
   assert.match(data.error, /API key/i);
+  // Must NOT leak the admin password
+  assert.equal(data.error.includes('sortd2026'), false);
+});
+
+test('Chat API Auth: verify_admin action validates password without leaking secrets', async () => {
+  const reqValid = new NextRequest('http://localhost:3000/api/chat', {
+    method: 'POST',
+    body: JSON.stringify({
+      action: 'verify_admin',
+      password: 'sortd2026',
+    }),
+  });
+  const resValid = await POST(reqValid);
+  assert.equal(resValid.status, 200);
+  const dataValid = await resValid.json();
+  assert.equal(dataValid.verified, true);
+
+  const reqInvalid = new NextRequest('http://localhost:3000/api/chat', {
+    method: 'POST',
+    body: JSON.stringify({
+      action: 'verify_admin',
+      password: 'wrong',
+    }),
+  });
+  const resInvalid = await POST(reqInvalid);
+  assert.equal(resInvalid.status, 401);
+  const dataInvalid = await resInvalid.json();
+  assert.equal(dataInvalid.verified, false);
+  assert.equal(dataInvalid.error.includes('sortd2026'), false);
 });
 
 test('Chat API Auth: accepts correct admin password sortd2026 and uses managed key', async () => {

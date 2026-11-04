@@ -81,7 +81,9 @@ export default function AIWorkbenchSidebar({
     apiKey: '',
     adminPassword: '',
   });
+  const [isAdminUnlocked, setIsAdminUnlocked] = useState(false);
   const [adminPasswordInput, setAdminPasswordInput] = useState('');
+  const [adminVerifyStatus, setAdminVerifyStatus] = useState<'idle' | 'checking' | 'error'>('idle');
 
   // Radar Telemetry Strip
   const [radar, setRadar] = useState<WorkbookRadar | null>(null);
@@ -147,7 +149,7 @@ export default function AIWorkbenchSidebar({
     }
   }, []);
 
-  // Load Settings from localStorage on mount
+  // Load Settings from localStorage on mount and verify admin if credentials exist
   useEffect(() => {
     try {
       const savedConfig = localStorage.getItem('sortd_model_config');
@@ -159,7 +161,23 @@ export default function AIWorkbenchSidebar({
         }
         setModelConfig(parsed);
         if (parsed.adminPassword) {
-          setAdminPasswordInput(parsed.adminPassword);
+          fetch('/api/chat', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              action: 'verify_admin',
+              password: parsed.adminPassword,
+            }),
+          })
+            .then((res) => {
+              if (res.ok) {
+                setIsAdminUnlocked(true);
+                setAdminPasswordInput(parsed.adminPassword);
+              } else {
+                setIsAdminUnlocked(false);
+              }
+            })
+            .catch(() => {});
         }
       }
       const savedGate = localStorage.getItem('sortd_require_confirmation');
@@ -170,6 +188,56 @@ export default function AIWorkbenchSidebar({
       // ignore
     }
   }, []);
+
+  const handleVerifyAdmin = async () => {
+    const password = adminPasswordInput.trim();
+    if (!password) return;
+    setAdminVerifyStatus('checking');
+    try {
+      const res = await fetch('/api/chat', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          action: 'verify_admin',
+          password,
+        }),
+      });
+      if (res.ok) {
+        setIsAdminUnlocked(true);
+        setAdminVerifyStatus('idle');
+        setModelConfig((prev) => ({
+          ...prev,
+          adminPassword: password,
+        }));
+      } else {
+        setIsAdminUnlocked(false);
+        setAdminVerifyStatus('error');
+      }
+    } catch {
+      setIsAdminUnlocked(false);
+      setAdminVerifyStatus('error');
+    }
+  };
+
+  const handleLockAdmin = () => {
+    setIsAdminUnlocked(false);
+    setAdminPasswordInput('');
+    setAdminVerifyStatus('idle');
+    setModelConfig((prev) => ({
+      ...prev,
+      adminPassword: '',
+    }));
+    try {
+      const saved = localStorage.getItem('sortd_model_config');
+      if (saved) {
+        const parsed = JSON.parse(saved);
+        delete parsed.adminPassword;
+        localStorage.setItem('sortd_model_config', JSON.stringify(parsed));
+      }
+    } catch {
+      // ignore
+    }
+  };
 
   const toggleConfirmationGate = () => {
     setRequireConfirmation((prev) => {
@@ -188,7 +256,7 @@ export default function AIWorkbenchSidebar({
     const updated: ModelConfig = {
       ...newConfig,
       model: newConfig.model?.trim() || 'anthropic/claude-haiku-5.5',
-      adminPassword: adminPasswordInput.trim(),
+      adminPassword: isAdminUnlocked ? adminPasswordInput.trim() : '',
     };
     setModelConfig(updated);
     try {
@@ -1093,7 +1161,7 @@ export default function AIWorkbenchSidebar({
           </div>
 
           <div className="flex items-center space-x-1.5 text-slate-400 text-[10px]">
-            {modelConfig.adminPassword === 'sortd2026' && (
+            {isAdminUnlocked && (
               <span className="px-1.5 py-0.2 rounded bg-emerald-50 border border-emerald-300 text-emerald-800 font-semibold text-[9.5px]">
                 PRO
               </span>
@@ -1170,7 +1238,7 @@ export default function AIWorkbenchSidebar({
                 </h3>
               </div>
               <div className="flex items-center space-x-2">
-                {adminPasswordInput.trim() === 'sortd2026' ? (
+                {isAdminUnlocked ? (
                   <span className="px-2 py-0.5 rounded-full bg-emerald-50 border border-emerald-200 text-emerald-700 font-medium text-[10px] flex items-center gap-1">
                     <ShieldCheck className="h-3 w-3 text-emerald-600" /> Pro Admin
                   </span>
@@ -1190,41 +1258,75 @@ export default function AIWorkbenchSidebar({
 
             <div className="space-y-3.5">
               {/* Pro User / Admin Access Section */}
-              <div className="rounded-xl border border-emerald-200/80 bg-emerald-50/40 p-3 space-y-2">
+              <div className="rounded-xl border border-slate-200 bg-slate-50/70 p-3 space-y-2.5">
                 <div className="flex items-center justify-between">
                   <div className="flex items-center space-x-1.5">
                     <ShieldCheck className="h-4 w-4 text-emerald-600" />
-                    <span className="font-semibold text-slate-800 text-xs">Pro User / Admin Access</span>
+                    <span className="font-semibold text-slate-800 text-xs">Pro / Admin Mode</span>
                   </div>
-                  {adminPasswordInput.trim() === 'sortd2026' && (
+                  {isAdminUnlocked ? (
                     <span className="text-[10px] font-semibold text-emerald-700 flex items-center gap-0.5">
                       <Check className="h-3 w-3" /> Unlocked
                     </span>
+                  ) : (
+                    <span className="text-[10px] text-slate-400">Password required</span>
                   )}
                 </div>
 
                 <p className="text-[11px] text-slate-600 leading-relaxed">
-                  Enter the admin password to use the built-in managed AI key (Claude Haiku 5.5). No personal API key required!
+                  {isAdminUnlocked
+                    ? 'Admin access is verified. Managed AI credentials (Claude Haiku) are active.'
+                    : 'Enter the admin password to unlock managed AI credentials. Otherwise, bring your own API key below.'}
                 </p>
 
-                <div className="space-y-1">
-                  <input
-                    type="password"
-                    value={adminPasswordInput}
-                    onChange={(e) => setAdminPasswordInput(e.target.value)}
-                    placeholder="Enter password (e.g. sortd2026)"
-                    className="w-full bg-white border border-slate-200 rounded-lg px-2.5 py-1.5 text-slate-800 text-[11px] focus:outline-none focus:border-emerald-500 font-mono"
-                  />
-                  {adminPasswordInput.trim() === 'sortd2026' ? (
-                    <p className="text-[10.5px] text-emerald-700 font-medium flex items-center gap-1 pt-0.5">
-                      <Check className="h-3 w-3" /> Admin access confirmed. Managed key active.
-                    </p>
-                  ) : adminPasswordInput.trim().length > 0 ? (
-                    <p className="text-[10.5px] text-amber-600 pt-0.5">
-                      Incorrect password. Please enter sortd2026 or use personal API key below.
-                    </p>
-                  ) : null}
-                </div>
+                {!isAdminUnlocked ? (
+                  <div className="space-y-1.5">
+                    <div className="flex gap-2">
+                      <input
+                        type="password"
+                        value={adminPasswordInput}
+                        onChange={(e) => {
+                          setAdminPasswordInput(e.target.value);
+                          if (adminVerifyStatus === 'error') setAdminVerifyStatus('idle');
+                        }}
+                        onKeyDown={(e) => {
+                          if (e.key === 'Enter') {
+                            e.preventDefault();
+                            handleVerifyAdmin();
+                          }
+                        }}
+                        placeholder="Enter admin password"
+                        className="flex-1 bg-white border border-slate-200 rounded-lg px-2.5 py-1.5 text-slate-800 text-[11px] focus:outline-none focus:border-emerald-500 font-mono"
+                      />
+                      <button
+                        type="button"
+                        onClick={handleVerifyAdmin}
+                        disabled={adminVerifyStatus === 'checking' || !adminPasswordInput.trim()}
+                        className="px-3 py-1.5 rounded-lg bg-emerald-600 hover:bg-emerald-700 disabled:opacity-50 text-white font-medium text-xs transition cursor-pointer"
+                      >
+                        {adminVerifyStatus === 'checking' ? 'Checking...' : 'Unlock'}
+                      </button>
+                    </div>
+                    {adminVerifyStatus === 'error' && (
+                      <p className="text-[10.5px] text-rose-600 font-medium">
+                        Incorrect password. Access denied.
+                      </p>
+                    )}
+                  </div>
+                ) : (
+                  <div className="flex items-center justify-between pt-1 border-t border-emerald-100">
+                    <span className="text-[10.5px] text-emerald-700 font-medium flex items-center gap-1">
+                      <Check className="h-3 w-3" /> Managed credentials active
+                    </span>
+                    <button
+                      type="button"
+                      onClick={handleLockAdmin}
+                      className="text-[10.5px] text-slate-500 hover:text-rose-600 underline cursor-pointer"
+                    >
+                      Lock Admin
+                    </button>
+                  </div>
+                )}
               </div>
 
               {/* Model Identifier */}
@@ -1288,9 +1390,9 @@ export default function AIWorkbenchSidebar({
                 <label className="text-slate-700 block mb-1 font-medium flex items-center justify-between">
                   <span>Personal API Key (BYOK)</span>
                   <span className="text-[10px] text-slate-400 font-normal">
-                    {adminPasswordInput.trim() === 'sortd2026'
+                    {isAdminUnlocked
                       ? 'Optional in Pro Admin mode'
-                      : 'Stored in local browser storage only'}
+                      : 'Required for standard users'}
                   </span>
                 </label>
                 <input
@@ -1298,7 +1400,7 @@ export default function AIWorkbenchSidebar({
                   value={modelConfig.apiKey || ''}
                   onChange={(e) => setModelConfig({ ...modelConfig, apiKey: e.target.value })}
                   placeholder={
-                    adminPasswordInput.trim() === 'sortd2026'
+                    isAdminUnlocked
                       ? 'Managed key active (optional custom override)'
                       : 'sk-or-v1-... or sk-...'
                   }
