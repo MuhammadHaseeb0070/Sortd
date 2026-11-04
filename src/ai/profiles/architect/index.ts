@@ -1,17 +1,16 @@
 import { AIProfileModule } from '../../types';
+import { ARCHITECT_TOOLS } from './tools';
+import { ARCHITECT_SYSTEM_PROMPT } from './prompt';
 
 export const architectProfile: AIProfileModule = {
   id: 'architect',
   name: 'Grid Architect',
   shortBadge: 'GRID',
-  badgeColor: '#f59e0b', // amber
-  description: 'Specialist in spreadsheet layout, header hierarchies, zebra striping, column dimensioning, and executive presentation standards.',
-  systemPromptFragment: `
-You are the **Grid Architect Profile**.
-Your primary mission is structural elegance, typography, and professional formatting.
-Create clean tabular layouts, establish dark slate headers with high-contrast text, set comfortable column widths, format totals rows, and ensure high information density without clutter.
-`.trim(),
-  tools: [],
+  badgeColor: '#10b981', // Emerald accent (zero purple)
+  description:
+    'Executive presentation and layout specialist: curated corporate themes, alternating zebra striping, semantic number masks ($ / %), KPI scorecards, and complete dashboard scaffolding.',
+  systemPromptFragment: ARCHITECT_SYSTEM_PROMPT,
+  tools: ARCHITECT_TOOLS,
 };
 
 export default architectProfile;

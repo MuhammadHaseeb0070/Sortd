@@ -1,37 +1,21 @@
-import { ToolExecutionContext } from '../../types';
+import type { ToolExecutionContext } from '../../types';
 import { guardRangeOutput } from '../../middleware/tokenGuard';
 import { verifyRangeMutation } from '../../middleware/formulaVerifier';
 import { colIndexToLetter, letterToColIndex, generateColumnHealthCard } from '../../radar';
+import {
+  resolveColumnSmart,
+  resolveWorksheet,
+  mapHorizontalAlignment,
+  reconcileRangeAndEnsureCapacity,
+  ensureSheetCapacity,
+  parseA1RangeBounds,
+} from '../../utils/univerBridge';
+import { jaroWinklerSimilarity } from '../../utils/dataHygiene';
 import { parseFlexibleDate, formatFormattedDate } from '../sanitizer/executors';
 
-// Levenshtein similarity calculation for fuzzy search (0.0 to 1.0)
+// Jaro-Winkler similarity calculation for fuzzy search (0.0 to 1.0)
 function calculateStringSimilarity(s1: string, s2: string): number {
-  const str1 = s1.toLowerCase();
-  const str2 = s2.toLowerCase();
-  if (str1 === str2) return 1.0;
-  if (str1.includes(str2) || str2.includes(str1)) return 0.85;
-
-  const longer = str1.length > str2.length ? str1 : str2;
-  const shorter = str1.length > str2.length ? str2 : str1;
-  if (longer.length === 0) return 1.0;
-
-  const costs: number[] = [];
-  for (let i = 0; i <= str1.length; i++) {
-    let lastVal = i;
-    for (let j = 0; j <= str2.length; j++) {
-      if (i === 0) costs[j] = j;
-      else if (j > 0) {
-        let newVal = costs[j - 1];
-        if (str1.charAt(i - 1) !== str2.charAt(j - 1)) {
-          newVal = Math.min(Math.min(newVal, lastVal), costs[j]) + 1;
-        }
-        costs[j - 1] = lastVal;
-        lastVal = newVal;
-      }
-    }
-    if (i > 0) costs[str2.length] = lastVal;
-  }
-  return (longer.length - costs[str2.length]) / longer.length;
+  return jaroWinklerSimilarity(s1.trim().toLowerCase(), s2.trim().toLowerCase());
 }
 
 /**
@@ -80,19 +64,52 @@ export async function executeInspectRange(
   const wb = ctx.univerAPI?.getActiveWorkbook?.();
   if (!wb) throw new Error('Univer active workbook unavailable');
 
-  const sheet = sheetName ? wb.getSheetByName?.(sheetName) : wb.getActiveSheet?.();
-  if (!sheet) throw new Error(`Worksheet ${sheetName || 'active'} not found`);
-
-  // Default range if omitted: occupied bounds of the sheet
-  let effectiveRange = rangeA1;
-  if (!effectiveRange) {
-    const lastRow = Math.max((sheet.getLastRow?.() ?? 0) + 1, 1);
-    const lastCol = Math.max((sheet.getLastColumn?.() ?? 0) + 1, 1);
-    effectiveRange = `A1:${colIndexToLetter(lastCol - 1)}${lastRow}`;
+  let parsedRange: any = null;
+  let targetSheetName = sheetName;
+  if (rangeA1) {
+    parsedRange = parseA1RangeBounds(rangeA1);
+    if (!targetSheetName && parsedRange.sheetPrefix) {
+      targetSheetName = parsedRange.sheetPrefix;
+    }
   }
 
-  const fRange = sheet.getRange(effectiveRange);
-  if (!fRange) throw new Error(`Failed to resolve range ${effectiveRange}`);
+  const sheet = resolveWorksheet(wb, targetSheetName);
+  if (!sheet) throw new Error(`Worksheet ${targetSheetName || 'active'} not found`);
+
+  const maxRows = Math.max(
+    typeof sheet.getRowCount === 'function' ? sheet.getRowCount() : 0,
+    sheet.getMaxRows?.() ?? 0,
+    sheet.getLastRow?.() !== undefined ? sheet.getLastRow() + 1 : 0,
+    1
+  );
+  const maxCols = Math.max(
+    typeof sheet.getColumnCount === 'function' ? sheet.getColumnCount() : 0,
+    sheet.getMaxColumns?.() ?? 0,
+    sheet.getLastColumn?.() !== undefined ? sheet.getLastColumn() + 1 : 0,
+    1
+  );
+
+  let localRangeStr = '';
+  let effectiveRangeWithSheet = '';
+
+  if (!rangeA1) {
+    const lastRow = Math.max((sheet.getLastRow?.() ?? 0) + 1, 1);
+    const lastCol = Math.max((sheet.getLastColumn?.() ?? 0) + 1, 1);
+    localRangeStr = `A1:${colIndexToLetter(lastCol - 1)}${lastRow}`;
+    effectiveRangeWithSheet = `${sheet.getSheetName?.() || 'Sheet'}!${localRangeStr}`;
+  } else {
+    if (!parsedRange) parsedRange = parseA1RangeBounds(rangeA1);
+    const clampedStartRow = Math.min(parsedRange.startRow, maxRows - 1);
+    const clampedStartCol = Math.min(parsedRange.startCol, maxCols - 1);
+    const clampedEndRow = Math.min(parsedRange.endRow, maxRows - 1);
+    const clampedEndCol = Math.min(parsedRange.endCol, maxCols - 1);
+
+    localRangeStr = `${colIndexToLetter(clampedStartCol)}${clampedStartRow + 1}:${colIndexToLetter(clampedEndCol)}${clampedEndRow + 1}`;
+    effectiveRangeWithSheet = `${sheet.getSheetName?.() || 'Sheet'}!${localRangeStr}`;
+  }
+
+  const fRange = sheet.getRange(localRangeStr);
+  if (!fRange) throw new Error(`Failed to resolve range ${localRangeStr}`);
 
   const startRow = typeof fRange.getRow === 'function' ? fRange.getRow() : 0;
   const startCol = typeof fRange.getColumn === 'function' ? fRange.getColumn() : 0;
@@ -109,7 +126,7 @@ export async function executeInspectRange(
 
   if (rawValues.length === 0) {
     return {
-      range: effectiveRange,
+      range: effectiveRangeWithSheet,
       totalRows: 0,
       filteredRows: 0,
       rows: [],
@@ -117,10 +134,15 @@ export async function executeInspectRange(
     };
   }
 
-  // Map columns to their relative indices within rawValues
-  const colLetterToIndex = (letter: string) => {
-    const absCol = letterToColIndex(letter.trim().toUpperCase());
-    return absCol - startCol;
+  // Map column letters OR header names to their relative indices within rawValues
+  const colLetterToIndex = (colRef: string) => {
+    try {
+      const resolved = resolveColumnSmart(sheet, colRef);
+      return resolved.colIndex - startCol;
+    } catch {
+      const absCol = letterToColIndex(colRef.trim().toUpperCase());
+      return absCol - startCol;
+    }
   };
 
   // Convert raw 2D grid into structured row items for processing
@@ -253,7 +275,7 @@ export async function executeInspectRange(
     }
 
     return {
-      range: effectiveRange,
+      range: effectiveRangeWithSheet,
       page,
       pageSize,
       totalMatchingRows: filteredData.length,
@@ -270,7 +292,7 @@ export async function executeInspectRange(
     finalFormulas.push(projectFormulaRow(item));
   }
 
-  const guarded = guardRangeOutput(finalRows, finalFormulas, effectiveRange);
+  const guarded = guardRangeOutput(finalRows, finalFormulas, effectiveRangeWithSheet);
   return {
     ...guarded,
     filterApplied: filter || null,
@@ -527,7 +549,7 @@ export async function executeSearchWorkbook(
   const sheet = sheetName ? wb.getSheetByName?.(sheetName) : wb.getActiveSheet?.();
   if (!sheet) throw new Error(`Worksheet ${sheetName || 'active'} unavailable`);
 
-  const lastRow = Math.min((sheet.getLastRow?.() ?? 0) + 1, 2000);
+  const lastRow = Math.min((sheet.getLastRow?.() ?? 0) + 1, 10000);
   const lastCol = Math.min((sheet.getLastColumn?.() ?? 0) + 1, 52);
   const fullRangeStr = `A1:${colIndexToLetter(lastCol - 1)}${lastRow}`;
 
@@ -654,24 +676,24 @@ export async function executeSearchWorkbook(
  * 4. PROFILE COLUMNS (Deep Data Quality, Dirtiness Detection & Recommendations)
  */
 export async function executeProfileColumns(
-  args: { columns: string[]; startRow?: number; endRow?: number },
+  args: { columns: string[]; startRow?: number; endRow?: number; sheetName?: string },
   ctx: ToolExecutionContext
 ) {
-  const { columns, startRow = 1, endRow } = args;
+  const { columns, startRow = 1, endRow, sheetName } = args;
   const wb = ctx.univerAPI?.getActiveWorkbook?.();
   if (!wb) throw new Error('Active workbook unavailable');
 
-  const sheet = wb.getActiveSheet?.();
-  if (!sheet) throw new Error('Active worksheet unavailable');
+  const sheet = resolveWorksheet(wb, sheetName);
+  if (!sheet) throw new Error(`Worksheet "${sheetName || 'active'}" unavailable`);
 
-  const maxSheetRow = (sheet.getLastRow?.() ?? 0) + 1;
+  const maxSheetRow = Math.max((sheet.getLastRow?.() ?? 0) + 1, 1);
   const effectiveEndRow = endRow ? Math.min(endRow, maxSheetRow) : maxSheetRow;
 
   const columnProfiles: Record<string, any> = {};
 
   for (const col of columns) {
-    const colTrimmed = col.trim().toUpperCase();
-    const colIdx = letterToColIndex(colTrimmed);
+    const resolved = resolveColumnSmart(sheet, col);
+    const colTrimmed = resolved.colLetter;
     const rangeNotation = `${colTrimmed}${startRow}:${colTrimmed}${effectiveEndRow}`;
     let values: any[][] = [];
     try {
@@ -681,15 +703,7 @@ export async function executeProfileColumns(
     }
 
     const flatVals = values.map((row) => row[0]);
-    let headerName = colTrimmed;
-    try {
-      const hVal = sheet.getRange(0, colIdx)?.getValue?.();
-      if (hVal !== undefined && hVal !== null && String(hVal).trim() !== '') {
-        headerName = String(hVal).trim();
-      }
-    } catch {
-      // ignore
-    }
+    const headerName = resolved.headerName || colTrimmed;
 
     const healthCard = generateColumnHealthCard(
       startRow === 1 ? flatVals.slice(1) : flatVals,
@@ -697,7 +711,7 @@ export async function executeProfileColumns(
       headerName
     );
 
-    columnProfiles[colTrimmed] = {
+    columnProfiles[`${colTrimmed} (${headerName})`] = {
       ...healthCard,
       analyzedRange: rangeNotation,
     };
@@ -712,12 +726,13 @@ export async function executeProfileColumns(
 export async function executeMutateCells(
   args: {
     rangeA1: string;
+    sheetName?: string;
     values2D?: any[][];
     formulaTemplate?: string;
     conditionalUpdate?: {
       targetCol: string;
       conditionCol: string;
-      operator: '>' | '<' | '>=' | '<=' | '==' | '!=';
+      operator: '>' | '<' | '>= ' | '<=' | '==' | '!=';
       conditionVal: any;
       newVal: any;
     };
@@ -725,15 +740,23 @@ export async function executeMutateCells(
   },
   ctx: ToolExecutionContext
 ) {
-  const { rangeA1, values2D, formulaTemplate, conditionalUpdate, clearFirst = false } = args;
+  const {
+    rangeA1,
+    sheetName,
+    values2D,
+    formulaTemplate,
+    conditionalUpdate,
+    clearFirst = false,
+  } = args;
   const wb = ctx.univerAPI?.getActiveWorkbook?.();
   if (!wb) throw new Error('Active workbook unavailable');
 
-  const sheet = wb.getActiveSheet?.();
-  if (!sheet) throw new Error('Active worksheet unavailable');
+  const sheet = resolveWorksheet(wb, sheetName);
+  if (!sheet) throw new Error(`Worksheet "${sheetName || 'active'}" unavailable`);
 
-  const fRange = sheet.getRange(rangeA1);
-  if (!fRange) throw new Error(`Could not locate range ${rangeA1}`);
+  const effectiveRangeA1 = reconcileRangeAndEnsureCapacity(sheet, rangeA1, values2D);
+  const fRange = sheet.getRange(effectiveRangeA1);
+  if (!fRange) throw new Error(`Could not locate range ${effectiveRangeA1}`);
 
   if (clearFirst) {
     try {
@@ -745,12 +768,16 @@ export async function executeMutateCells(
 
   // Mode A: Formula Template Auto-Fill Mode (e.g. formulaTemplate: "=B{row}-C{row}" across D2:D500)
   if (formulaTemplate) {
-    const startRow = fRange.getRow() + 1; // 1-indexed
-    const endRow = fRange.getLastRow() + 1;
+    const startRow = (typeof fRange.getRow === 'function' ? fRange.getRow() : 0) + 1; // 1-indexed
+    const endRow =
+      (typeof fRange.getLastRow === 'function' ? fRange.getLastRow() : startRow - 1) + 1;
     const numRows = Math.max(endRow - startRow + 1, 1);
-    const startCol = fRange.getColumn();
-    const endCol = fRange.getLastColumn();
+    const startCol = typeof fRange.getColumn === 'function' ? fRange.getColumn() : 0;
+    const endCol =
+      typeof fRange.getLastColumn === 'function' ? fRange.getLastColumn() : startCol;
     const numCols = Math.max(endCol - startCol + 1, 1);
+
+    ensureSheetCapacity(sheet, endRow, endCol + 1);
 
     const generatedMatrix: string[][] = [];
     for (let r = 0; r < numRows; r++) {
@@ -764,18 +791,17 @@ export async function executeMutateCells(
     }
 
     fRange.setValues(generatedMatrix);
-    return await verifyRangeMutation(sheet, rangeA1);
+    return await verifyRangeMutation(sheet, effectiveRangeA1);
   }
 
   // Mode B: Conditional Update Mode (e.g. Set targetCol = newVal where conditionCol == conditionVal)
   if (conditionalUpdate) {
     const { targetCol, conditionCol, operator, conditionVal, newVal } = conditionalUpdate;
     const existingValues: any[][] = fRange.getValues?.() || [];
-    const startRow = fRange.getRow();
-    const startCol = fRange.getColumn();
+    const startCol = typeof fRange.getColumn === 'function' ? fRange.getColumn() : 0;
 
-    const targetRelCol = letterToColIndex(targetCol) - startCol;
-    const condRelCol = letterToColIndex(conditionCol) - startCol;
+    const targetRelCol = resolveColumnSmart(sheet, targetCol).colIndex - startCol;
+    const condRelCol = resolveColumnSmart(sheet, conditionCol).colIndex - startCol;
 
     if (targetRelCol < 0 || condRelCol < 0) {
       throw new Error('conditionalUpdate columns must fall within target range');
@@ -785,12 +811,13 @@ export async function executeMutateCells(
     const updatedValues = existingValues.map((row) => {
       const cVal = row[condRelCol];
       let matches = false;
-      if (operator === '==') matches = cVal == conditionVal;
-      else if (operator === '!=') matches = cVal != conditionVal;
-      else if (operator === '>') matches = Number(cVal) > Number(conditionVal);
-      else if (operator === '<') matches = Number(cVal) < Number(conditionVal);
-      else if (operator === '>=') matches = Number(cVal) >= Number(conditionVal);
-      else if (operator === '<=') matches = Number(cVal) <= Number(conditionVal);
+      const op = String(operator).trim();
+      if (op === '==') matches = cVal == conditionVal;
+      else if (op === '!=') matches = cVal != conditionVal;
+      else if (op === '>') matches = Number(cVal) > Number(conditionVal);
+      else if (op === '<') matches = Number(cVal) < Number(conditionVal);
+      else if (op === '>=') matches = Number(cVal) >= Number(conditionVal);
+      else if (op === '<=') matches = Number(cVal) <= Number(conditionVal);
 
       if (matches) {
         row[targetRelCol] = newVal;
@@ -800,9 +827,11 @@ export async function executeMutateCells(
     });
 
     fRange.setValues(updatedValues);
+    const verification = await verifyRangeMutation(sheet, effectiveRangeA1);
     return {
-      success: true,
-      range: rangeA1,
+      ...verification,
+      success: verification.status !== 'ERROR',
+      range: effectiveRangeA1,
       conditionalUpdatedRows: updatedRows,
       message: `Updated ${updatedRows} row(s) where ${conditionCol} ${operator} ${conditionVal}`,
     };
@@ -811,7 +840,7 @@ export async function executeMutateCells(
   // Mode C: 2D Matrix Mode
   if (values2D && Array.isArray(values2D) && values2D.length > 0) {
     fRange.setValues(values2D);
-    return await verifyRangeMutation(sheet, rangeA1);
+    return await verifyRangeMutation(sheet, effectiveRangeA1);
   }
 
   throw new Error(
@@ -820,7 +849,7 @@ export async function executeMutateCells(
 }
 
 /**
- * 6. MODIFY STRUCTURE (Auto-Fit Columns, Freeze Panes, Delete Empty Rows, Dimensions)
+ * 6. MODIFY STRUCTURE (Auto-Fit Columns, Freeze Panes, Sort Range, Delete Empty Rows, Dimensions)
  */
 export async function executeModifyStructure(
   args: {
@@ -833,6 +862,10 @@ export async function executeModifyStructure(
       | 'unmerge_range'
       | 'create_sheet'
       | 'rename_sheet'
+      | 'delete_sheet'
+      | 'freeze_panes'
+      | 'unfreeze_panes'
+      | 'sort_range'
       | 'set_column_width'
       | 'auto_fit_columns'
       | 'delete_empty_rows';
@@ -842,22 +875,37 @@ export async function executeModifyStructure(
     sheetName?: string;
     widthPx?: number;
     columns?: string[];
+    sortColumn?: string;
+    sortAscending?: boolean;
   },
   ctx: ToolExecutionContext
 ) {
-  const { action, index = 0, count = 1, rangeA1, sheetName, widthPx, columns } = args;
+  const {
+    action,
+    index = 0,
+    count = 1,
+    rangeA1,
+    sheetName,
+    widthPx,
+    columns,
+    sortColumn,
+    sortAscending = true,
+  } = args;
   const wb = ctx.univerAPI?.getActiveWorkbook?.();
   if (!wb) throw new Error('Active workbook unavailable');
 
-  const sheet = wb.getActiveSheet?.();
-  if (!sheet) throw new Error('Active worksheet unavailable');
+  const sheet =
+    action === 'create_sheet' || action === 'rename_sheet'
+      ? wb.getActiveSheet?.()
+      : resolveWorksheet(wb, sheetName);
+  if (!sheet) throw new Error('Target worksheet unavailable');
 
   switch (action) {
     case 'auto_fit_columns': {
       const lastRow = Math.min((sheet.getLastRow?.() ?? 0) + 1, 500);
       const colsToFit =
         columns && columns.length > 0
-          ? columns.map((c) => letterToColIndex(c.trim().toUpperCase()))
+          ? columns.map((c) => resolveColumnSmart(sheet, c).colIndex)
           : Array.from(
               { length: Math.min((sheet.getLastColumn?.() ?? 0) + 1, 26) },
               (_, i) => i
@@ -920,6 +968,68 @@ export async function executeModifyStructure(
       };
     }
 
+    case 'freeze_panes': {
+      const rowsToFreeze = index > 0 ? index : count > 0 ? count : 1;
+      sheet.setFrozenRows?.(rowsToFreeze);
+      return {
+        success: true,
+        frozenRows: rowsToFreeze,
+        message: `Froze top ${rowsToFreeze} row(s) on "${sheet.getName?.() || sheet.getSheetName?.() || 'Sheet'}".`,
+      };
+    }
+
+    case 'unfreeze_panes': {
+      sheet.cancelFreeze?.();
+      sheet.setFrozenRows?.(0);
+      sheet.setFrozenColumns?.(0);
+      return {
+        success: true,
+        message: `Unfroze all rows and columns.`,
+      };
+    }
+
+    case 'sort_range': {
+      const lastRow = Math.max((sheet.getLastRow?.() ?? 0) + 1, 1);
+      const lastCol = Math.max((sheet.getLastColumn?.() ?? 0) + 1, 1);
+      const targetRangeStr = rangeA1 || `A1:${colIndexToLetter(lastCol - 1)}${lastRow}`;
+      const fRange = sheet.getRange(targetRangeStr);
+      if (!fRange) throw new Error(`Could not resolve range ${targetRangeStr} for sorting`);
+
+      const allRows: any[][] = fRange.getValues?.() || [];
+      if (allRows.length <= 2) {
+        return { success: true, message: 'Range has <= 1 data row; no sorting needed.' };
+      }
+
+      const resolvedSortCol = sortColumn ? resolveColumnSmart(sheet, sortColumn).colIndex : 0;
+      const startColOffset = typeof fRange.getColumn === 'function' ? fRange.getColumn() : 0;
+      const relSortIdx = Math.max(0, resolvedSortCol - startColOffset);
+      const dir = sortAscending ? 1 : -1;
+
+      const header = allRows[0];
+      const body = allRows.slice(1);
+      body.sort((a, b) => {
+        const va = a[relSortIdx];
+        const vb = b[relSortIdx];
+        if (va === vb) return 0;
+        if (va === null || va === undefined || va === '') return 1;
+        if (vb === null || vb === undefined || vb === '') return -1;
+        const na = Number(String(va).replace(/[$,%\s]/g, ''));
+        const nb = Number(String(vb).replace(/[$,%\s]/g, ''));
+        if (!isNaN(na) && !isNaN(nb)) return (na - nb) * dir;
+        return String(va).localeCompare(String(vb)) * dir;
+      });
+
+      fRange.setValues([header, ...body]);
+      return {
+        success: true,
+        range: targetRangeStr,
+        sortedBy: colIndexToLetter(resolvedSortCol),
+        direction: sortAscending ? 'asc' : 'desc',
+        rowsSorted: body.length,
+        message: `Sorted ${body.length} data rows in ${targetRangeStr} by column ${colIndexToLetter(resolvedSortCol)} (${sortAscending ? 'ASC' : 'DESC'}).`,
+      };
+    }
+
     case 'insert_rows':
       sheet.insertRows?.(index, count);
       return { success: true, message: `Inserted ${count} row(s) at index ${index}` };
@@ -950,14 +1060,39 @@ export async function executeModifyStructure(
 
     case 'create_sheet': {
       const name = sheetName || `Sheet_${Date.now().toString(36).slice(-4)}`;
+      const existing = resolveWorksheet(wb, name);
+      if (existing) {
+        wb.setActiveSheet?.(existing);
+        ctx.onWorkbookMutated?.();
+        return {
+          success: true,
+          sheetName: name,
+          message: `Worksheet "${name}" already exists and is now active. Proceed to populate it immediately!`,
+        };
+      }
       wb.insertSheet?.(name);
-      return { success: true, sheetName: name, message: `Created new worksheet "${name}"` };
+      ctx.onWorkbookMutated?.();
+      return {
+        success: true,
+        sheetName: name,
+        message: `Created new worksheet "${name}". IMPORTANT: The sheet is currently blank — proceed IMMEDIATELY to write headers, data, or formulas into "${name}" in your next tool call!`,
+      };
     }
 
     case 'rename_sheet': {
       if (!sheetName) throw new Error('rename_sheet requires sheetName');
       sheet.setName?.(sheetName);
+      ctx.onWorkbookMutated?.();
       return { success: true, message: `Renamed sheet to "${sheetName}"` };
+    }
+
+    case 'delete_sheet': {
+      if (!sheetName) throw new Error('delete_sheet requires sheetName');
+      const toDelete = resolveWorksheet(wb, sheetName);
+      if (!toDelete) throw new Error(`Sheet "${sheetName}" not found`);
+      wb.deleteSheet?.(toDelete);
+      ctx.onWorkbookMutated?.();
+      return { success: true, message: `Deleted worksheet "${sheetName}"` };
     }
 
     case 'set_column_width': {
@@ -980,6 +1115,7 @@ export async function executeModifyStructure(
 export async function executeStyleRange(
   args: {
     rangeA1: string;
+    sheetName?: string;
     backgroundColor?: string;
     fontColor?: string;
     bold?: boolean;
@@ -991,6 +1127,7 @@ export async function executeStyleRange(
 ) {
   const {
     rangeA1,
+    sheetName,
     backgroundColor,
     fontColor,
     bold,
@@ -1002,8 +1139,8 @@ export async function executeStyleRange(
   const wb = ctx.univerAPI?.getActiveWorkbook?.();
   if (!wb) throw new Error('Active workbook unavailable');
 
-  const sheet = wb.getActiveSheet?.();
-  if (!sheet) throw new Error('Active worksheet unavailable');
+  const sheet = resolveWorksheet(wb, sheetName);
+  if (!sheet) throw new Error(`Worksheet "${sheetName || 'active'}" unavailable`);
 
   const fRange = sheet.getRange(rangeA1);
   if (!fRange) throw new Error(`Target range ${rangeA1} not found`);
@@ -1012,11 +1149,15 @@ export async function executeStyleRange(
   if (fontColor) fRange.setFontColor?.(fontColor);
   if (bold !== undefined) fRange.setFontWeight?.(bold ? 'bold' : null);
   if (italic !== undefined) fRange.setFontStyle?.(italic ? 'italic' : null);
-  if (horizontalAlignment) fRange.setHorizontalAlignment?.(horizontalAlignment);
+  if (horizontalAlignment) {
+    const mappedAlign = mapHorizontalAlignment(horizontalAlignment);
+    if (mappedAlign) fRange.setHorizontalAlignment?.(mappedAlign);
+  }
   if (fontSize) fRange.setFontSize?.(fontSize);
 
   return {
     success: true,
+    sheetName: sheet.getName?.() || sheet.getSheetName?.(),
     styledRange: rangeA1,
     applied: { backgroundColor, fontColor, bold, italic, horizontalAlignment, fontSize },
   };
@@ -1035,6 +1176,7 @@ export async function executeSwitchProfile(
     success: true,
     switchedTo: targetProfile,
     handoffSummary,
+    instruction: `Profile context is now handed off to '${targetProfile}'. You are NOW operating as the '${targetProfile}' specialist. You MUST IMMEDIATELY call your specialized tools in this step to fulfill the user's request. DO NOT output conversational text announcing the switch; execute the tools directly!`,
     message: `Profile context dynamically handed off to '${targetProfile}'.`,
   };
 }

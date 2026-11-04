@@ -10,12 +10,12 @@ interface MarkdownMessageProps {
 
 export default function MarkdownMessage({ content }: MarkdownMessageProps) {
   return (
-    <div className="markdown-body text-[12.5px] leading-relaxed text-slate-800 break-words font-sans selection:bg-emerald-100">
+    <div className="markdown-body text-[12.5px] leading-relaxed text-slate-800 break-words font-sans selection:bg-emerald-100 select-text cursor-text">
       <ReactMarkdown
         remarkPlugins={[remarkGfm]}
         components={{
           p: ({ children }) => (
-            <p className="mb-2 last:mb-0 leading-relaxed text-slate-700 font-normal">
+            <p className="mb-2 last:mb-0 leading-relaxed text-slate-700 font-normal select-text cursor-text">
               {children}
             </p>
           ),
@@ -28,38 +28,38 @@ export default function MarkdownMessage({ content }: MarkdownMessageProps) {
             <em className="italic text-slate-600 font-normal">{children}</em>
           ),
           h1: ({ children }) => (
-            <h1 className="text-[14px] font-bold text-slate-900 mt-3.5 mb-1.5 first:mt-0 tracking-tight flex items-center space-x-1.5">
+            <h1 className="text-[14px] font-bold text-slate-900 mt-3.5 mb-1.5 first:mt-0 tracking-tight flex items-center space-x-1.5 select-text">
               <span className="w-1.5 h-1.5 rounded-full bg-emerald-600 inline-block shrink-0" />
               <span>{children}</span>
             </h1>
           ),
           h2: ({ children }) => (
-            <h2 className="text-[13px] font-semibold text-slate-900 mt-3 mb-1 first:mt-0 tracking-tight">
+            <h2 className="text-[13px] font-semibold text-slate-900 mt-3 mb-1 first:mt-0 tracking-tight select-text">
               {children}
             </h2>
           ),
           h3: ({ children }) => (
-            <h3 className="text-[12px] font-semibold text-slate-800 mt-2 mb-1 first:mt-0">
+            <h3 className="text-[12px] font-semibold text-slate-800 mt-2 mb-1 first:mt-0 select-text">
               {children}
             </h3>
           ),
           ul: ({ children }) => (
-            <ul className="list-disc list-outside pl-4 space-y-1 my-2 text-[12px] text-slate-700 marker:text-emerald-600">
+            <ul className="list-disc list-outside pl-4 space-y-1 my-2 text-[12px] text-slate-700 marker:text-emerald-600 select-text">
               {children}
             </ul>
           ),
           ol: ({ children }) => (
-            <ol className="list-decimal list-outside pl-4 space-y-1 my-2 text-[12px] text-slate-700 marker:text-slate-500 font-mono text-[11px]">
+            <ol className="list-decimal list-outside pl-4 space-y-1 my-2 text-[12px] text-slate-700 marker:text-slate-500 font-mono text-[11px] select-text">
               {children}
             </ol>
           ),
           li: ({ children }) => (
-            <li className="leading-relaxed pl-0.5">{children}</li>
+            <li className="leading-relaxed pl-0.5 select-text">{children}</li>
           ),
           code: ({ className, children, ...props }: any) => {
             return (
               <code
-                className="font-mono text-[11px] px-1.5 py-0.5 rounded bg-slate-100 text-emerald-800 border border-slate-200 font-medium"
+                className="font-mono text-[11px] px-1.5 py-0.5 rounded bg-slate-100 text-emerald-800 border border-slate-200 font-medium select-text cursor-text"
                 {...props}
               >
                 {children}
@@ -67,7 +67,7 @@ export default function MarkdownMessage({ content }: MarkdownMessageProps) {
             );
           },
           pre: ({ children }) => (
-            <pre className="my-2 p-2.5 rounded-md bg-slate-50 border border-slate-200 overflow-x-auto text-[11px] font-mono text-slate-800 leading-normal">
+            <pre className="my-2 p-2.5 rounded-md bg-slate-50 border border-slate-200 overflow-x-auto text-[11px] font-mono text-slate-800 leading-normal select-text cursor-text">
               {children}
             </pre>
           ),

@@ -3,6 +3,16 @@ import type { IWorkbookData, IWorksheetData, Nullable, IRange } from '@univerjs/
 import { LocaleType } from '@univerjs/presets';
 
 /**
+ * Formats a JS Date object cleanly into YYYY-MM-DD so Date.toString() timezone noise never pollutes cells.
+ */
+function formatJsDateIso(d: Date): string {
+  const year = d.getFullYear();
+  const month = String(d.getMonth() + 1).padStart(2, '0');
+  const day = String(d.getDate()).padStart(2, '0');
+  return `${year}-${month}-${day}`;
+}
+
+/**
  * Parses an uploaded .xlsx or .csv file into Univer's IWorkbookData structure.
  */
 export async function parseExcelFileToUniverData(file: File): Promise<IWorkbookData> {
@@ -38,7 +48,6 @@ export async function parseExcelFileToUniverData(file: File): Promise<IWorkbookD
       maxCol = range.e.c;
     }
 
-    // Process all cells in the worksheet
     Object.keys(worksheet).forEach((key) => {
       if (key.startsWith('!')) return;
 
@@ -57,6 +66,9 @@ export async function parseExcelFileToUniverData(file: File): Promise<IWorkbookD
         let cellValue: string | number | boolean | undefined = undefined;
         if (cell.t === 'b') {
           cellValue = Boolean(cell.v);
+        } else if (cell.t === 'd' || cell.v instanceof Date) {
+          const dObj = cell.v instanceof Date ? cell.v : new Date(cell.v);
+          cellValue = !isNaN(dObj.getTime()) ? formatJsDateIso(dObj) : String(cell.w || cell.v);
         } else if (cell.t === 'n') {
           cellValue = typeof cell.v === 'number' ? cell.v : Number(cell.v);
         } else if (cell.v !== undefined && cell.v !== null) {
@@ -77,7 +89,6 @@ export async function parseExcelFileToUniverData(file: File): Promise<IWorkbookD
       }
     });
 
-    // Parse merged cells if present
     const mergeData: IRange[] = [];
     if (worksheet['!merges']) {
       worksheet['!merges'].forEach((m) => {
@@ -90,8 +101,20 @@ export async function parseExcelFileToUniverData(file: File): Promise<IWorkbookD
       });
     }
 
-    const rowCount = Math.max(maxRow + 10, 36);
-    const columnCount = Math.max(maxCol + 5, 26);
+    // Preserve imported column widths if present
+    const columnData: Record<number, { w?: number }> = {};
+    if (Array.isArray(worksheet['!cols'])) {
+      worksheet['!cols'].forEach((colInfo, cIdx) => {
+        if (colInfo && typeof colInfo.wpx === 'number') {
+          columnData[cIdx] = { w: Math.max(60, Math.min(360, colInfo.wpx)) };
+        } else if (colInfo && typeof colInfo.wch === 'number') {
+          columnData[cIdx] = { w: Math.max(60, Math.min(360, Math.round(colInfo.wch * 8))) };
+        }
+      });
+    }
+
+    const rowCount = Math.max(maxRow + 20, 100);
+    const columnCount = Math.max(maxCol + 8, 26);
 
     sheets[sheetId] = {
       id: sheetId,
@@ -101,6 +124,7 @@ export async function parseExcelFileToUniverData(file: File): Promise<IWorkbookD
       columnCount,
       tabColor: '',
       mergeData,
+      ...(Object.keys(columnData).length > 0 ? { columnData } : {}),
     };
   });
 
@@ -143,12 +167,11 @@ export function exportUniverToExcel(univerAPI: any, fileName?: string): void {
     typeof activeWorkbook.save === 'function' ? activeWorkbook.save() : null;
 
   if (snapshot && snapshot.sheets && snapshot.sheetOrder) {
-    // Export using saved snapshot data
     snapshot.sheetOrder.forEach((sheetId) => {
       const sheetData = snapshot.sheets[sheetId];
       if (!sheetData) return;
 
-      const sheetName = sheetData.name || `Sheet_${sheetId}`;
+      const sheetName = (sheetData.name || `Sheet_${sheetId}`).slice(0, 31);
       const cellData = sheetData.cellData || {};
       const ws: XLSX.WorkSheet = {};
 
@@ -211,10 +234,20 @@ export function exportUniverToExcel(univerAPI: any, fileName?: string): void {
         }));
       }
 
+      if (sheetData.columnData) {
+        const cols: XLSX.ColInfo[] = [];
+        for (const [colIdxStr, colMeta] of Object.entries(sheetData.columnData)) {
+          const cIdx = Number(colIdxStr);
+          if (Number.isFinite(cIdx) && colMeta && typeof (colMeta as any).w === 'number') {
+            cols[cIdx] = { wpx: (colMeta as any).w };
+          }
+        }
+        if (cols.length > 0) ws['!cols'] = cols;
+      }
+
       XLSX.utils.book_append_sheet(wb, ws, sheetName);
     });
   } else {
-    // Fallback using active sheets directly
     const sheets = typeof activeWorkbook.getSheets === 'function' ? activeWorkbook.getSheets() : [];
     if (sheets.length === 0) {
       const activeSheet = activeWorkbook.getActiveSheet?.();
@@ -222,7 +255,7 @@ export function exportUniverToExcel(univerAPI: any, fileName?: string): void {
     }
 
     sheets.forEach((sheet: any) => {
-      const sheetName = sheet.getSheetName?.() || 'Sheet1';
+      const sheetName = (sheet.getSheetName?.() || 'Sheet1').slice(0, 31);
       const lastRow = Math.max(sheet.getLastRow?.() ?? 0, 0);
       const lastCol = Math.max(sheet.getLastColumn?.() ?? 0, 0);
 
@@ -257,7 +290,6 @@ export function exportUniverToExcel(univerAPI: any, fileName?: string): void {
     });
   }
 
-  // Generate binary output and download in browser
   const defaultBaseName = activeWorkbook.getName?.() || 'workbook';
   const outName = fileName || `${defaultBaseName}.xlsx`;
   const finalFileName = outName.toLowerCase().endsWith('.xlsx') ? outName : `${outName}.xlsx`;

@@ -1,17 +1,16 @@
 import { AIProfileModule } from '../../types';
+import { VISUALIZER_TOOLS } from './tools';
+import { VISUALIZER_SYSTEM_PROMPT } from './prompt';
 
 export const visualizerProfile: AIProfileModule = {
   id: 'visualizer',
   name: 'Visualizer',
   shortBadge: 'VIZ',
-  badgeColor: '#ec4899', // pink
-  description: 'Specialist in visual telemetry, summary dashboard cards, conditional formatting palettes, and graphical presentation.',
-  systemPromptFragment: `
-You are the **Visualizer Profile**.
-Your primary mission is transforming dry data tables into visually striking dashboards.
-Design color-coded KPI metric tiles, apply data bars or heat-map color scales, and configure optimal chart datasets.
-`.trim(),
-  tools: [],
+  badgeColor: '#10b981', // emerald
+  description:
+    'Specialist in high-fidelity interactive charting (15 chart types with AI recommendations), in-cell heatmaps, proportional data bars, status badges, and sparkline trend series.',
+  systemPromptFragment: VISUALIZER_SYSTEM_PROMPT,
+  tools: VISUALIZER_TOOLS,
 };
 
 export default visualizerProfile;

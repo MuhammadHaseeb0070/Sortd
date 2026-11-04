@@ -15,10 +15,20 @@ export interface ColumnSchema {
   sampleValues: any[];
 }
 
+export interface SheetHeaderBrief {
+  colLetter: string;
+  header: string;
+  sampleType?: string;
+}
+
 export interface SheetMetaSummary {
   name: string;
   rowCount: number;
   colCount: number;
+  populatedRows?: number;
+  populatedCols?: number;
+  occupiedBounds?: string;
+  headers?: SheetHeaderBrief[];
 }
 
 export interface ColumnHealthCard {
@@ -27,7 +37,15 @@ export interface ColumnHealthCard {
   totalRowsScanned: number;
   nullCount: number;
   uniqueCount: number;
-  detectedType: 'number' | 'string' | 'date' | 'percentage' | 'currency' | 'mixed' | 'empty';
+  detectedType:
+    | 'number'
+    | 'string'
+    | 'date'
+    | 'percentage'
+    | 'currency'
+    | 'formula'
+    | 'mixed'
+    | 'empty';
   typeCensus: {
     integers: number;
     decimals: number;
@@ -45,8 +63,12 @@ export interface ColumnHealthCard {
     min?: number;
     max?: number;
     mean?: number;
+    median?: number;
     variance?: number;
+    skewness?: number;
   } | null;
+  entityCollisions?: string[];
+  formulaTemplate?: string;
   hazardAlerts: string[];
 }
 
@@ -59,12 +81,17 @@ export interface WorkbookRadar {
   topRowsPreview: any[][];
   columnSchemas: ColumnSchema[];
   columnHealthCards?: Record<string, ColumnHealthCard>;
+  subtotalTrapRows?: number[];
+  repeatedHeaderRows?: number[];
 }
 
 export interface ToolExecutionContext {
   univerAPI: any;
   activeProfileId: ProfileId;
   onProfileSwitch: (newProfile: ProfileId, reason: string) => void;
+  onWorkbookMutated?: () => void;
+  onChartGenerated?: (chart: ChartPayload) => void;
+  signal?: AbortSignal;
 }
 
 export interface AIToolDefinition {
@@ -94,6 +121,28 @@ export interface ToolExecutionLedgerItem {
   inputArgs: any;
   resultData: any;
   timestamp: number;
+}
+
+export interface CellDiffSample {
+  sheetName: string;
+  coordinate: string;
+  beforeValue: any;
+  afterValue: any;
+  changeType: 'added' | 'modified' | 'deleted';
+}
+
+export interface StagedMutationSummary {
+  id: string;
+  turnPrompt: string;
+  createdSheets: string[];
+  modifiedRanges: Array<{
+    sheetName: string;
+    rangeA1: string;
+    toolName: string;
+    description: string;
+  }>;
+  sampleCellDiffs: CellDiffSample[];
+  totalCellsAffected: number;
 }
 
 export interface FormulaErrorItem {
@@ -155,6 +204,66 @@ export interface ChatMessage {
   content: string;
   timestamp: number;
   ledgerItems?: ToolExecutionLedgerItem[];
+}
+
+export type ChartType =
+  | 'auto'
+  | 'column'
+  | 'bar'
+  | 'line'
+  | 'area'
+  | 'donut'
+  | 'scatter'
+  | 'bubble'
+  | 'combo_dual_axis'
+  | 'waterfall'
+  | 'treemap'
+  | 'funnel'
+  | 'radar'
+  | 'pareto'
+  | 'histogram'
+  | 'box_plot';
+
+export interface ChartSeries {
+  name: string;
+  data: number[];
+  color?: string;
+  yAxisIndex?: number; // 0 = primary, 1 = secondary
+  type?: 'bar' | 'line' | 'area';
+  scatterPoints?: Array<{ x: number; y: number; r?: number; label?: string }>;
+  boxPlotStats?: Array<{
+    category: string;
+    min: number;
+    q1: number;
+    median: number;
+    q3: number;
+    max: number;
+    outliers?: number[];
+  }>;
+  waterfallItems?: Array<{
+    label: string;
+    value: number;
+    start: number;
+    end: number;
+    isTotal?: boolean;
+  }>;
+}
+
+export interface ChartPayload {
+  id: string;
+  title: string;
+  subtitle?: string;
+  chartType: ChartType;
+  categories: string[];
+  series: ChartSeries[];
+  xAxisLabel?: string;
+  yAxisLabel?: string;
+  secondaryYAxisLabel?: string;
+  range: string;
+  sheetName: string;
+  statsSummary?: string;
+  expertAdvisory?: string;
+  timestamp: number;
 }
 
 export interface ModelConfig {

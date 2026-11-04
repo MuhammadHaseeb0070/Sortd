@@ -3,9 +3,13 @@ import {
   executeSynthesizeColumns,
   executeSplitColumn,
   executeDeduplicateDataset,
+  executeRemoveRepeatedHeaders,
+  executeFilterSliceDataset,
   executeImputeData,
   executeReshapeDataset,
   executeStandardizeDates,
+  executeInspectAndClusterCategories,
+  executeCleanAndImputeCurrency,
 } from './executors';
 
 export const SANITIZER_TOOLS: AIToolDefinition[] = [
@@ -181,7 +185,7 @@ export const SANITIZER_TOOLS: AIToolDefinition[] = [
   {
     name: 'deduplicate_dataset',
     description:
-      'High-performance row-level deduplication engine. Supports exact matching, fuzzy similarity matching (handles typos), intelligent tie-breakers (keeps newest, highest value, or most complete row), duplicate coalescing (merges non-null data from duplicates), and quarantine/flagging actions.',
+      'High-performance row-level deduplication and record conflict detection engine. Supports exact matching, fuzzy similarity matching, conflict detection (same keys but different attribute values, e.g. same Order & SKU but different Quantity), intelligent tie-breakers, coalescing, repeating pagination header cleanup, and reporting/quarantine/deletion actions.',
     parameters: {
       type: 'object',
       properties: {
@@ -189,7 +193,18 @@ export const SANITIZER_TOOLS: AIToolDefinition[] = [
           type: 'array',
           items: { type: 'string' },
           description:
-            'Column letters or header names that define uniqueness (e.g. ["Email"] or ["Customer_ID", "Order_Date"]). If omitted, uses all occupied columns.',
+            'Column letters or header names that define uniqueness (e.g. ["Email"] or ["OrderID", "SKU"]). If omitted, uses all occupied columns.',
+        },
+        conflictColumns: {
+          type: 'array',
+          items: { type: 'string' },
+          description:
+            'Optional columns to evaluate for conflict/inconsistency. When specified, only groups where these columns have DIFFERING values are reported (e.g. keyColumns: ["OrderID", "SKU"], conflictColumns: ["Quantity"]). Conflicting rows are never deleted.',
+        },
+        removeExactDuplicatesFirst: {
+          type: 'boolean',
+          description:
+            'When true alongside conflictColumns, removes 100%-identical full-row duplicates and repeated headers in-place FIRST, then reports the remaining conflicting groups with their updated row numbers in a single pass!',
         },
         matchMode: {
           type: 'string',
@@ -226,9 +241,9 @@ export const SANITIZER_TOOLS: AIToolDefinition[] = [
         },
         action: {
           type: 'string',
-          enum: ['delete_rows', 'quarantine_to_sheet', 'flag_column'],
+          enum: ['delete_rows', 'quarantine_to_sheet', 'flag_column', 'report_only'],
           description:
-            '"delete_rows" removes duplicates in-place; "quarantine_to_sheet" moves duplicates to a separate review sheet; "flag_column" adds an Is_Duplicate column without deleting.',
+            '"delete_rows" removes duplicates in-place; "quarantine_to_sheet" moves duplicates to a separate review sheet; "flag_column" adds an Is_Duplicate column; "report_only" returns full duplicate/conflict details in the receipt without modifying or deleting any rows.',
         },
         flagColumnHeader: {
           type: 'string',
@@ -237,6 +252,11 @@ export const SANITIZER_TOOLS: AIToolDefinition[] = [
         targetSheetName: {
           type: 'string',
           description: 'Custom worksheet name for action "quarantine_to_sheet". Defaults to "{sheet}_Duplicates".',
+        },
+        stripRepeatedHeaders: {
+          type: 'boolean',
+          description:
+            'When true (default), automatically detects and removes repeating pagination/export header rows matching row 1 before evaluating duplicates.',
         },
         startRow: {
           type: 'number',
@@ -253,6 +273,142 @@ export const SANITIZER_TOOLS: AIToolDefinition[] = [
       },
     },
     execute: executeDeduplicateDataset,
+  },
+  {
+    name: 'remove_repeated_headers',
+    description:
+      'Fast, vectorized cleanup of repeating pagination or multi-page export header rows (e.g. "OrderID", "Date" re-appearing at rows 500, 1000). Detects rows matching the top header and deletes them in-place in 1 call.',
+    parameters: {
+      type: 'object',
+      properties: {
+        sheetName: {
+          type: 'string',
+          description: 'Worksheet name. Defaults to active worksheet.',
+        },
+      },
+    },
+    execute: executeRemoveRepeatedHeaders,
+  },
+  {
+    name: 'filter_slice_dataset',
+    description:
+      'Filters, extracts, and slices rows from a dataset into a target worksheet in ONE single vectorized call. Supports multi-condition filtering (e.g. Status == "Cancelled"), automatic target sheet creation, ERP pagination header stripping, column projection, and in-memory currency/metric aggregations (count and total sums grouped by Currency) with executive summary tables. Always use this instead of manually mutating cells in loops!',
+    parameters: {
+      type: 'object',
+      properties: {
+        sourceSheetName: {
+          type: 'string',
+          description: 'Source worksheet containing the dataset. Defaults to active worksheet.',
+        },
+        targetSheetName: {
+          type: 'string',
+          description:
+            'Target worksheet name where matching rows will be extracted (e.g. "Cancelled"). Created automatically if it does not exist.',
+        },
+        filterConditions: {
+          type: 'array',
+          items: {
+            type: 'object',
+            properties: {
+              column: {
+                type: 'string',
+                description: 'Column header name or letter (e.g. "Status" or "Order_Status" or "G").',
+              },
+              operator: {
+                type: 'string',
+                enum: [
+                  '==',
+                  '!=',
+                  '>',
+                  '<',
+                  '>=',
+                  '<=',
+                  'contains',
+                  'in',
+                  'startsWith',
+                  'endsWith',
+                  'regex',
+                  'isNull',
+                  'notNull',
+                ],
+                description: 'Comparison operator. Default "==".',
+              },
+              value: {
+                description: 'Value to compare against (e.g. "Cancelled", or ["Cancelled", "Refunded"]).',
+              },
+              matchCase: {
+                type: 'boolean',
+                description: 'Whether string comparisons are case-sensitive. Default false.',
+              },
+            },
+            required: ['column', 'operator'],
+          },
+          description: 'Array of filter criteria to evaluate against rows.',
+        },
+        conditionLogic: {
+          type: 'string',
+          enum: ['AND', 'OR'],
+          description: 'Combine multiple filter conditions with "AND" or "OR". Default "AND".',
+        },
+        columns: {
+          type: 'array',
+          items: { type: 'string' },
+          description:
+            'Optional subset of column headers or letters to project into the target sheet. Defaults to all columns.',
+        },
+        action: {
+          type: 'string',
+          enum: ['copy_to_target', 'move_to_target', 'report_only'],
+          description:
+            'Action to perform: "copy_to_target" (default), "move_to_target" (deletes matching rows from source), or "report_only" (dry run preview).',
+        },
+        summarizeMetrics: {
+          type: 'array',
+          items: {
+            type: 'object',
+            properties: {
+              groupBy: {
+                type: 'string',
+                description: 'Column to group summaries by (e.g. "Currency" or "Region").',
+              },
+              metricColumn: {
+                type: 'string',
+                description: 'Column to aggregate (e.g. "Total" or "Total Value" or "Quantity").',
+              },
+              derivedFormula: {
+                type: 'string',
+                description:
+                  'Optional expression to derive metric if column does not exist (e.g. "Quantity * UnitPrice").',
+              },
+              aggregate: {
+                type: 'string',
+                enum: ['count', 'sum', 'average', 'min', 'max'],
+                description: 'Aggregation function.',
+              },
+              alias: {
+                type: 'string',
+                description: 'Custom label for the metric column in the summary table.',
+              },
+            },
+            required: ['aggregate'],
+          },
+          description:
+            'Optional metrics to compute over the filtered dataset (e.g. count and sum of Total Value grouped by Currency).',
+        },
+        writeSummaryBlock: {
+          type: 'boolean',
+          description:
+            'Whether to write an executive summary table on the target worksheet beside the extracted rows. Default true.',
+        },
+        stripSourceRepeatedHeaders: {
+          type: 'boolean',
+          description:
+            'Whether to detect and skip repeating pagination header rows from ERP exports. Default true.',
+        },
+      },
+      required: ['filterConditions'],
+    },
+    execute: executeFilterSliceDataset,
   },
   {
     name: 'impute_data',
@@ -402,6 +558,27 @@ export const SANITIZER_TOOLS: AIToolDefinition[] = [
           type: 'string',
           description: 'Optional destination column. If omitted, standardizes the source column in-place.',
         },
+        countryColumn: {
+          type: 'string',
+          description:
+            'Optional column specifying customer country (e.g. "Country" or "CustomerCountry"). Automatically evaluates US customers as month-first (MM/DD/YYYY) and all other countries as day-first (DD/MM/YYYY).',
+        },
+        insertPlacement: {
+          type: 'string',
+          enum: ['inplace', 'right_of_source', 'append'],
+          description:
+            'How to place the standardized date column: "right_of_source" inserts a new column right next to the date column with header in the true table header row; "inplace" overwrites; "append" places at the end of the sheet.',
+        },
+        newHeader: {
+          type: 'string',
+          description:
+            'Header name for the new date column (e.g. "Order Date (ISO)").',
+        },
+        strictNoGuess: {
+          type: 'boolean',
+          description:
+            'When true, never guesses 2-digit years or impossible calendar dates (e.g. Feb 30), leaving them blank and listing every unparseable row with its exact Excel row number.',
+        },
         startRow: {
           type: 'number',
           description: '1-indexed start row. Default 2 (row 1 is header).',
@@ -418,5 +595,129 @@ export const SANITIZER_TOOLS: AIToolDefinition[] = [
       required: ['column'],
     },
     execute: executeStandardizeDates,
+  },
+  {
+    name: 'inspect_and_cluster_categories',
+    description:
+      'Scans categorical columns (e.g. Region, Department, Status, Vendor) for dirty variants, abbreviations, punctuation noise, and Jaro-Winkler typos (such as "North" vs "N", "N.", "north", or "West" vs "W"). Returns exact canonical clusters and optionally normalizes all dirty variants in-place in 1 shot.',
+    parameters: {
+      type: 'object',
+      properties: {
+        columns: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'Array of column letters or header names to inspect/normalize (e.g. ["Region", "Status"]).',
+        },
+        applyNormalization: {
+          type: 'boolean',
+          description: 'If true (default), automatically replaces dirty variants in-place with their canonical entity name.',
+        },
+        customSynonyms: {
+          type: 'object',
+          description: 'Optional custom mapping of dirty variant -> canonical label (e.g. {"NYC": "New York"}).',
+        },
+        startRow: {
+          type: 'number',
+          description: '1-indexed start row. Default 2.',
+        },
+        endRow: {
+          type: 'number',
+          description: '1-indexed end row. Defaults to last occupied row.',
+        },
+        sheetName: {
+          type: 'string',
+          description: 'Worksheet name. Defaults to active worksheet.',
+        },
+      },
+      required: ['columns'],
+    },
+    execute: executeInspectAndClusterCategories,
+  },
+  {
+    name: 'clean_and_impute_currency',
+    description:
+      'Parses mixed international currency strings (e.g. "1.299,00 €", "¥15,800", "$100.50"), separates numeric amounts and clean ISO currency codes (EUR, JPY, USD), and derives/imputes blank prices from a reference product sheet (e.g. Products list price) converted at daily exchange rates (e.g. FX_Rates). Existing values are NEVER overwritten by reference prices. Executes in-engine in 1 vectorized call without writing fragile cross-sheet formulas.',
+    parameters: {
+      type: 'object',
+      properties: {
+        sheetName: {
+          type: 'string',
+          description: 'Name of the worksheet to clean (e.g. "Orders").',
+        },
+        sourceColumn: {
+          type: 'string',
+          description: 'Source column containing currency strings or blank values (e.g. "UnitPrice" or "D").',
+        },
+        targetColumn: {
+          type: 'string',
+          description:
+            'Optional destination column for clean numeric amounts. If omitted, cleans sourceColumn in-place.',
+        },
+        currencyColumnName: {
+          type: 'string',
+          description:
+            'Name of the currency code column (e.g. "Currency" or "CurrencyCode"). If not present in the sheet, creates a new column right next to the price column.',
+        },
+        imputeBlanks: {
+          type: 'object',
+          description:
+            'Optional configuration to derive blank prices from reference product catalog and daily FX rates.',
+          properties: {
+            keyColumn: {
+              type: 'string',
+              description:
+                'Key column in current sheet to join with reference catalog (e.g. "SKU" or "ProductID").',
+            },
+            lookupSheetName: {
+              type: 'string',
+              description: 'Name of worksheet containing reference list prices (e.g. "Products").',
+            },
+            lookupKeyColumn: {
+              type: 'string',
+              description: 'Key column in reference catalog (e.g. "SKU" or "ProductID").',
+            },
+            lookupPriceColumn: {
+              type: 'string',
+              description: 'List price column in reference catalog (e.g. "ListPrice" or "Price").',
+            },
+            dateColumn: {
+              type: 'string',
+              description:
+                'Date column in current sheet used for FX rate matching (e.g. "OrderDate" or "Date").',
+            },
+            fxSheetName: {
+              type: 'string',
+              description: 'Name of worksheet containing daily FX rates (e.g. "FX_Rates").',
+            },
+            fxDateColumn: {
+              type: 'string',
+              description: 'Date column in FX rates sheet (e.g. "Date").',
+            },
+            baseCurrency: {
+              type: 'string',
+              description:
+                'Base currency of reference list prices (e.g. "USD"). Defaults to "USD".',
+            },
+          },
+          required: ['keyColumn', 'lookupSheetName', 'lookupKeyColumn', 'lookupPriceColumn'],
+        },
+        headerRowIndex: {
+          type: 'number',
+          description:
+            'Optional 1-indexed table header row. If omitted, auto-detected even with report title banners.',
+        },
+        startRow: {
+          type: 'number',
+          description:
+            'Optional 1-indexed data start row. Defaults to row after detected header.',
+        },
+        endRow: {
+          type: 'number',
+          description: 'Optional 1-indexed end row. Defaults to last occupied row.',
+        },
+      },
+      required: ['sheetName', 'sourceColumn'],
+    },
+    execute: executeCleanAndImputeCurrency,
   },
 ];

@@ -733,6 +733,10 @@ export default function SpreadsheetWorkspace({
           isDragging={isDraggingSidebar}
           setIsDragging={setIsDraggingSidebar}
           currentSelection={telemetry.selectedRange}
+          onWorkbookMutated={() => {
+            refreshTelemetry();
+            setTimeout(refreshTelemetry, 120);
+          }}
         />
       </div>
     </div>

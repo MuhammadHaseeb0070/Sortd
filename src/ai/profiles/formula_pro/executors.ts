@@ -1,6 +1,7 @@
-import { ToolExecutionContext } from '../../types';
-import { colIndexToLetter, letterToColIndex } from '../../radar';
+import type { ToolExecutionContext } from '../../types';
+import { colIndexToLetter } from '../../radar';
 import { verifyRangeMutation } from '../../middleware/formulaVerifier';
+import { resolveColumnSmart, ensureSheetCapacity } from '../../utils/univerBridge';
 
 /**
  * Escapes a worksheet name for safe use in Excel formulas.
@@ -16,65 +17,38 @@ function escapeSheetName(sheetName?: string): string {
 }
 
 /**
- * Resolves a column identifier (letter or header label) to letter and index on a given sheet.
+ * Resolves a column identifier (Row 1 header label FIRST, then Excel column letter) on a given sheet.
  */
 function resolveSheetColumn(
   sheet: any,
   colRef: string | number,
   headerRowIdx: number = 0
 ): { colIndex: number; colLetter: string; headerName: string } {
-  if (typeof colRef === 'number') {
-    return {
-      colIndex: colRef,
-      colLetter: colIndexToLetter(colRef),
-      headerName: String(sheet.getRange(headerRowIdx, colRef)?.getValue?.() || colIndexToLetter(colRef)),
-    };
+  return resolveColumnSmart(sheet, colRef, headerRowIdx);
+}
+
+/**
+ * Formats a criterion operator + value for SUMIFS / COUNTIFS / AVERAGEIFS
+ */
+function formatCriteriaExpression(crit: {
+  operator?: string;
+  value: any;
+  isCellReference?: boolean;
+}): string {
+  const op = (crit.operator || '=').toLowerCase();
+  if (crit.isCellReference) {
+    if (op === 'contains') return `"*" & ${crit.value} & "*"`;
+    if (op === 'starts_with') return `${crit.value} & "*"`;
+    if (op === 'ends_with') return `"*" & ${crit.value}`;
+    return op !== '=' ? `"${crit.operator}" & ${crit.value}` : String(crit.value);
   }
-
-  const trimmed = String(colRef).trim();
-  if (/^[A-Za-z]+$/.test(trimmed)) {
-    const colIdx = letterToColIndex(trimmed);
-    let headerName = trimmed;
-    try {
-      const val = sheet.getRange(headerRowIdx, colIdx)?.getValue?.();
-      if (val !== undefined && val !== null && String(val).trim() !== '') {
-        headerName = String(val).trim();
-      }
-    } catch {
-      // ignore
-    }
-    return { colIndex: colIdx, colLetter: trimmed.toUpperCase(), headerName };
+  if (op === 'contains') return `"*${crit.value}*"`;
+  if (op === 'starts_with') return `"${crit.value}*"`;
+  if (op === 'ends_with') return `"*${crit.value}"`;
+  if (crit.operator && crit.operator !== '=') {
+    return `"${crit.operator}${crit.value}"`;
   }
-
-  // Header match
-  const maxCol = Math.min((sheet.getLastColumn?.() ?? 0) + 1, 100);
-  let bestIdx = -1;
-  let bestHeader = trimmed;
-
-  try {
-    const headerRowVals = sheet.getRange(headerRowIdx, 0, 1, maxCol)?.getValues?.()?.[0] || [];
-    for (let c = 0; c < headerRowVals.length; c++) {
-      const h = String(headerRowVals[c] || '').trim();
-      if (h.toLowerCase() === trimmed.toLowerCase()) {
-        bestIdx = c;
-        bestHeader = h;
-        break;
-      }
-    }
-  } catch {
-    // ignore
-  }
-
-  if (bestIdx !== -1) {
-    return {
-      colIndex: bestIdx,
-      colLetter: colIndexToLetter(bestIdx),
-      headerName: bestHeader,
-    };
-  }
-
-  const fallbackIdx = letterToColIndex(trimmed);
-  return { colIndex: fallbackIdx, colLetter: colIndexToLetter(fallbackIdx), headerName: trimmed };
+  return typeof crit.value === 'number' ? String(crit.value) : `"${crit.value}"`;
 }
 
 /**
@@ -110,7 +84,6 @@ export async function executeBuildLookup(
     mode = 'index_match',
     twoWayColumnHeader,
     fallbackValue = 'Not Found',
-    writeAsFormulas = true,
     startRow = 2,
     endRow,
   } = args;
@@ -128,7 +101,11 @@ export async function executeBuildLookup(
   const effectiveEndRow = endRow ? Math.min(endRow, lastTargetRow) : lastTargetRow;
 
   const escapedSrcSheet = escapeSheetName(sourceSheetName);
-  const resolvedTargetCol = resolveSheetColumn(targetSheet, targetRangeA1.split(':')[0].replace(/\d+/g, ''), 0);
+  const resolvedTargetCol = resolveSheetColumn(
+    targetSheet,
+    targetRangeA1.split(':')[0].replace(/\d+/g, ''),
+    0
+  );
   const resolvedLookupKey = resolveSheetColumn(targetSheet, lookupKeyColumn, 0);
 
   const resolvedSourceKey = resolveSheetColumn(sourceSheet, sourceKeyColumn, 0);
@@ -149,28 +126,29 @@ export async function executeBuildLookup(
     if (mode === 'xlookup') {
       formulaStr = `=XLOOKUP(${keyCellRef}, ${srcKeyRange}, ${srcReturnRange}, ${safeFallback})`;
     } else if (mode === 'two_way' && twoWayColumnHeader) {
-      // 2-way matrix lookup: INDEX(Table, MATCH(rowKey, rowRange, 0), MATCH(colKey, colRange, 0))
-      const srcHeaderRange = `${escapedSrcSheet}!$A$1:$${colIndexToLetter((sourceSheet.getLastColumn?.() ?? 26) - 1)}$1`;
-      const fullTableRange = `${escapedSrcSheet}!$A$2:$${colIndexToLetter((sourceSheet.getLastColumn?.() ?? 26) - 1)}$${srcLastRow}`;
+      const srcHeaderRange = `${escapedSrcSheet}!$A$1:$${colIndexToLetter(
+        Math.max((sourceSheet.getLastColumn?.() ?? 25), 0)
+      )}$1`;
+      const fullTableRange = `${escapedSrcSheet}!$A$2:$${colIndexToLetter(
+        Math.max((sourceSheet.getLastColumn?.() ?? 25), 0)
+      )}$${srcLastRow}`;
       formulaStr = `=IFERROR(INDEX(${fullTableRange}, MATCH(${keyCellRef}, ${srcKeyRange}, 0), MATCH("${twoWayColumnHeader}", ${srcHeaderRange}, 0)), ${safeFallback})`;
     } else {
-      // Universal INDEX/MATCH with IFERROR guard (100% compatible across all spreadsheet engines)
       formulaStr = `=IFERROR(INDEX(${srcReturnRange}, MATCH(${keyCellRef}, ${srcKeyRange}, 0)), ${safeFallback})`;
     }
 
     formulasOrValues.push([formulaStr]);
   }
 
-  // Determine write range notation
+  ensureSheetCapacity(targetSheet, effectiveEndRow + 2, resolvedTargetCol.colIndex + 2);
   const writeRange = `${resolvedTargetCol.colLetter}${startRow}:${resolvedTargetCol.colLetter}${effectiveEndRow}`;
   targetSheet.getRange(writeRange)?.setValues?.(formulasOrValues);
 
-  // Run self-healing formula verification pass
   const verifyReceipt = await verifyRangeMutation(targetSheet, writeRange);
-
   const durationMs = Math.round(performance.now() - t0);
 
   return {
+    status: verifyReceipt.status,
     success: verifyReceipt.status === 'SUCCESS',
     action: 'build_lookup',
     mode,
@@ -191,12 +169,20 @@ export async function executeComposeAggregation(
   args: {
     targetCell: string;
     targetSheetName?: string;
-    functionType: 'SUMIFS' | 'COUNTIFS' | 'AVERAGEIFS' | 'SUM' | 'AVERAGE' | 'COUNT' | 'MINIFS' | 'MAXIFS';
+    functionType:
+      | 'SUMIFS'
+      | 'COUNTIFS'
+      | 'AVERAGEIFS'
+      | 'SUM'
+      | 'AVERAGE'
+      | 'COUNT'
+      | 'MINIFS'
+      | 'MAXIFS';
     dataSheetName?: string;
     measureColumn?: string;
     criteria?: Array<{
       column: string;
-      operator?: '=' | '>' | '<' | '>=' | '<=' | '<>' | 'contains';
+      operator?: '=' | '>' | '<' | '>=' | '<=' | '<>' | 'contains' | 'starts_with' | 'ends_with';
       value: any;
       isCellReference?: boolean;
     }>;
@@ -226,7 +212,8 @@ export async function executeComposeAggregation(
   const dataSheet = dataSheetName ? wb.getSheetByName?.(dataSheetName) : destSheet;
   if (!dataSheet) throw new Error(`Data worksheet ${dataSheetName || 'active'} not found`);
 
-  const escapedDataSheet = dataSheet !== destSheet ? `${escapeSheetName(dataSheet.getSheetName?.())}!` : '';
+  const escapedDataSheet =
+    dataSheet !== destSheet ? `${escapeSheetName(dataSheet.getSheetName?.())}!` : '';
   const lastDataRow = Math.max((dataSheet.getLastRow?.() ?? 0) + 1, 100);
   const effectiveEndRow = endRow ? Math.min(endRow, lastDataRow) : lastDataRow;
 
@@ -242,19 +229,10 @@ export async function executeComposeAggregation(
     for (const crit of criteria) {
       const resolvedCritCol = resolveSheetColumn(dataSheet, crit.column, 0);
       const critRange = `${escapedDataSheet}$${resolvedCritCol.colLetter}$${startRow}:$${resolvedCritCol.colLetter}$${effectiveEndRow}`;
-      let critValStr = '';
-      if (crit.isCellReference) {
-        critValStr = crit.operator && crit.operator !== '=' ? `"${crit.operator}" & ${crit.value}` : crit.value;
-      } else if (crit.operator && crit.operator !== '=') {
-        critValStr = `"${crit.operator}${crit.value}"`;
-      } else {
-        critValStr = typeof crit.value === 'number' ? String(crit.value) : `"${crit.value}"`;
-      }
-      parts.push(`${critRange}, ${critValStr}`);
+      parts.push(`${critRange}, ${formatCriteriaExpression(crit)}`);
     }
     formula = `=COUNTIFS(${parts.join(', ')})`;
   } else {
-    // SUMIFS, AVERAGEIFS, MINIFS, MAXIFS: (measureRange, critRange1, crit1, critRange2, crit2, ...)
     if (!measureColumn) throw new Error(`${functionType} requires measureColumn`);
     const resolvedMeasure = resolveSheetColumn(dataSheet, measureColumn, 0);
     const measureRange = `${escapedDataSheet}$${resolvedMeasure.colLetter}$${startRow}:$${resolvedMeasure.colLetter}$${effectiveEndRow}`;
@@ -263,27 +241,18 @@ export async function executeComposeAggregation(
     for (const crit of criteria) {
       const resolvedCritCol = resolveSheetColumn(dataSheet, crit.column, 0);
       const critRange = `${escapedDataSheet}$${resolvedCritCol.colLetter}$${startRow}:$${resolvedCritCol.colLetter}$${effectiveEndRow}`;
-      let critValStr = '';
-      if (crit.isCellReference) {
-        critValStr = crit.operator && crit.operator !== '=' ? `"${crit.operator}" & ${crit.value}` : crit.value;
-      } else if (crit.operator && crit.operator !== '=') {
-        critValStr = `"${crit.operator}${crit.value}"`;
-      } else {
-        critValStr = typeof crit.value === 'number' ? String(crit.value) : `"${crit.value}"`;
-      }
-      parts.push(`${critRange}, ${critValStr}`);
+      parts.push(`${critRange}, ${formatCriteriaExpression(crit)}`);
     }
     formula = `=${functionType}(${parts.join(', ')})`;
   }
 
-  // Write formula to cell
   destSheet.getRange(targetCell)?.setValues?.([[formula]]);
 
-  // Verify
   const verifyReceipt = await verifyRangeMutation(destSheet, targetCell);
   const durationMs = Math.round(performance.now() - t0);
 
   return {
+    status: verifyReceipt.status,
     success: verifyReceipt.status === 'SUCCESS',
     action: 'compose_aggregation',
     formula,
@@ -297,7 +266,7 @@ export async function executeComposeAggregation(
 
 /**
  * 3. GENERATE FINANCIAL MODEL
- * Builds full loan amortizations, compound interest schedules, NPV/IRR formulas, and depreciation tables.
+ * Builds full loan amortizations (with 0% rate guard), compound interest schedules, NPV/IRR formulas, and depreciation tables.
  */
 export async function executeGenerateFinancialModel(
   args: {
@@ -305,23 +274,20 @@ export async function executeGenerateFinancialModel(
     sheetName?: string;
     targetSheetName?: string;
     startCell?: string;
-    // Loan Amortization parameters
     principal?: number;
-    annualInterestRate?: number; // e.g. 0.065 for 6.5%
+    annualInterestRate?: number;
     loanTermYears?: number;
-    paymentsPerYear?: number; // default 12
-    // Investment parameters
+    paymentsPerYear?: number;
     initialDeposit?: number;
     monthlyContribution?: number;
     annualReturnRate?: number;
     projectionYears?: number;
-    // Depreciation parameters
     assetCost?: number;
     salvageValue?: number;
     usefulLifeYears?: number;
     depreciationMethod?: 'SLN' | 'DB';
-    // Cash flow range for NPV/IRR
     cashFlowRangeA1?: string;
+    initialOutlayCellA1?: string;
     discountRate?: number;
   },
   ctx: ToolExecutionContext
@@ -345,6 +311,7 @@ export async function executeGenerateFinancialModel(
     usefulLifeYears = 5,
     depreciationMethod = 'SLN',
     cashFlowRangeA1,
+    initialOutlayCellA1,
     discountRate = 0.1,
   } = args;
 
@@ -360,15 +327,20 @@ export async function executeGenerateFinancialModel(
   if (!destSheet) throw new Error('Target worksheet unavailable');
 
   const destSheetName = destSheet.getSheetName?.() || 'Model';
+  const startRange = destSheet.getRange(startCell);
+  const originRow = typeof startRange?.getRow === 'function' ? startRange.getRow() : 0;
+  const originCol = typeof startRange?.getColumn === 'function' ? startRange.getColumn() : 0;
 
   if (modelType === 'loan_amortization') {
-    const totalPayments = Math.round(loanTermYears * paymentsPerYear);
+    const totalPayments = Math.max(1, Math.round(loanTermYears * paymentsPerYear));
     const periodicRate = annualInterestRate / paymentsPerYear;
 
-    // Monthly PMT formula
+    // 0% interest rate guard so we never divide by zero!
     const pmt =
-      (principal * (periodicRate * Math.pow(1 + periodicRate, totalPayments))) /
-      (Math.pow(1 + periodicRate, totalPayments) - 1);
+      Math.abs(periodicRate) < 1e-9
+        ? principal / totalPayments
+        : (principal * (periodicRate * Math.pow(1 + periodicRate, totalPayments))) /
+          (Math.pow(1 + periodicRate, totalPayments) - 1);
 
     const headers = [
       'Payment #',
@@ -379,6 +351,12 @@ export async function executeGenerateFinancialModel(
       'Ending Balance',
     ];
 
+    const colB = colIndexToLetter(originCol + 1);
+    const colC = colIndexToLetter(originCol + 2);
+    const colD = colIndexToLetter(originCol + 3);
+    const colE = colIndexToLetter(originCol + 4);
+    const colF = colIndexToLetter(originCol + 5);
+
     const matrix: any[][] = [];
     let currentBalance = principal;
 
@@ -387,26 +365,27 @@ export async function executeGenerateFinancialModel(
       const principalPart = pmt - interestPart;
       const endingBalance = Math.max(currentBalance - principalPart, 0);
 
-      const rowIdx = i + 1; // 1-based header is row 1
+      const rowIdx = originRow + i + 1;
       matrix.push([
         i,
-        i === 1 ? principal : `=F${rowIdx - 1}`,
+        i === 1 ? principal : `=${colF}${rowIdx - 1}`,
         Number(pmt.toFixed(2)),
-        `=C${rowIdx}-E${rowIdx}`,
-        `=B${rowIdx}*(${annualInterestRate}/${paymentsPerYear})`,
-        `=B${rowIdx}-D${rowIdx}`,
+        `=${colC}${rowIdx}-${colE}${rowIdx}`,
+        `=${colB}${rowIdx}*(${annualInterestRate}/${paymentsPerYear})`,
+        `=${colB}${rowIdx}-${colD}${rowIdx}`,
       ]);
 
       currentBalance = endingBalance;
     }
 
-    // Write headers and schedule
-    destSheet.getRange(0, 0, 1, headers.length)?.setValues?.([headers]);
-    destSheet.getRange(1, 0, matrix.length, headers.length)?.setValues?.(matrix);
+    ensureSheetCapacity(destSheet, originRow + matrix.length + 3, originCol + headers.length + 1);
+    destSheet.getRange(originRow, originCol, 1, headers.length)?.setValues?.([headers]);
+    destSheet.getRange(originRow + 1, originCol, matrix.length, headers.length)?.setValues?.(matrix);
 
     const durationMs = Math.round(performance.now() - t0);
 
     return {
+      status: 'SUCCESS',
       success: true,
       action: 'generate_financial_model',
       modelType: 'loan_amortization',
@@ -415,15 +394,20 @@ export async function executeGenerateFinancialModel(
       monthlyPayment: Number(pmt.toFixed(2)),
       totalInterestPaid: Number((pmt * totalPayments - principal).toFixed(2)),
       durationMs,
-      message: `Generated ${totalPayments}-period loan amortization schedule in sheet "${destSheetName}" with monthly payment of $${pmt.toFixed(2)}.`,
+      message: `Generated ${totalPayments}-period loan amortization schedule in sheet "${destSheetName}" with payment of $${pmt.toFixed(2)}.`,
     };
   }
 
   if (modelType === 'compound_interest') {
-    const totalMonths = projectionYears * 12;
+    const totalMonths = Math.max(1, projectionYears * 12);
     const monthlyRate = annualReturnRate / 12;
 
     const headers = ['Year', 'Month', 'Starting Balance', 'Contribution', 'Interest Earned', 'Ending Balance'];
+    const colC = colIndexToLetter(originCol + 2);
+    const colD = colIndexToLetter(originCol + 3);
+    const colE = colIndexToLetter(originCol + 4);
+    const colF = colIndexToLetter(originCol + 5);
+
     const matrix: any[][] = [];
     let currentBalance = initialDeposit;
 
@@ -431,24 +415,26 @@ export async function executeGenerateFinancialModel(
       const year = Math.ceil(m / 12);
       const interest = currentBalance * monthlyRate;
       const ending = currentBalance + monthlyContribution + interest;
-      const rIdx = m + 1;
+      const rIdx = originRow + m + 1;
 
       matrix.push([
         year,
         m,
-        m === 1 ? initialDeposit : `=F${rIdx - 1}`,
+        m === 1 ? initialDeposit : `=${colF}${rIdx - 1}`,
         monthlyContribution,
-        `=C${rIdx}*(${annualReturnRate}/12)`,
-        `=C${rIdx}+D${rIdx}+E${rIdx}`,
+        `=${colC}${rIdx}*(${annualReturnRate}/12)`,
+        `=${colC}${rIdx}+${colD}${rIdx}+${colE}${rIdx}`,
       ]);
 
       currentBalance = ending;
     }
 
-    destSheet.getRange(0, 0, 1, headers.length)?.setValues?.([headers]);
-    destSheet.getRange(1, 0, matrix.length, headers.length)?.setValues?.(matrix);
+    ensureSheetCapacity(destSheet, originRow + matrix.length + 3, originCol + headers.length + 1);
+    destSheet.getRange(originRow, originCol, 1, headers.length)?.setValues?.([headers]);
+    destSheet.getRange(originRow + 1, originCol, matrix.length, headers.length)?.setValues?.(matrix);
 
     return {
+      status: 'SUCCESS',
       success: true,
       action: 'generate_financial_model',
       modelType: 'compound_interest',
@@ -461,61 +447,77 @@ export async function executeGenerateFinancialModel(
   if (modelType === 'npv_irr') {
     if (!cashFlowRangeA1) throw new Error('npv_irr requires cashFlowRangeA1');
 
-    const npvFormula = `=NPV(${discountRate}, ${cashFlowRangeA1})`;
+    // If initialOutlayCellA1 is provided, keep Year-0 outlay outside Excel's NPV() function per financial standard
+    const npvFormula = initialOutlayCellA1
+      ? `=${initialOutlayCellA1}+NPV(${discountRate}, ${cashFlowRangeA1})`
+      : `=NPV(${discountRate}, ${cashFlowRangeA1})`;
     const irrFormula = `=IRR(${cashFlowRangeA1})`;
 
-    destSheet.getRange(startCell)?.setValues?.([
+    destSheet.getRange(originRow, originCol, 3, 2)?.setValues?.([
       ['Discount Rate', discountRate],
       ['Net Present Value (NPV)', npvFormula],
       ['Internal Rate of Return (IRR)', irrFormula],
     ]);
 
     return {
+      status: 'SUCCESS',
       success: true,
       action: 'generate_financial_model',
       modelType: 'npv_irr',
       npvFormula,
       irrFormula,
-      message: `Generated NPV and IRR valuation formulas in ${startCell}.`,
+      message: `Generated NPV and IRR valuation formulas starting at ${startCell}.`,
     };
   }
 
   // Depreciation
-  const headers = ['Year', 'Beginning Book Value', 'Depreciation Expense', 'Accumulated Depreciation', 'Ending Book Value'];
-  const matrix: any[][] = [];
-  const annualDepreciation = (assetCost - salvageValue) / usefulLifeYears;
-  let bookVal = assetCost;
-  let accumDep = 0;
+  const headers = [
+    'Year',
+    'Beginning Book Value',
+    'Depreciation Expense',
+    'Accumulated Depreciation',
+    'Ending Book Value',
+  ];
+  const colB = colIndexToLetter(originCol + 1);
+  const colC = colIndexToLetter(originCol + 2);
+  const colD = colIndexToLetter(originCol + 3);
+  const colE = colIndexToLetter(originCol + 4);
 
-  for (let yr = 1; yr <= usefulLifeYears; yr++) {
-    const expense = annualDepreciation;
-    accumDep += expense;
-    bookVal -= expense;
-    const rIdx = yr + 1;
+  const matrix: any[][] = [];
+  const safeLife = Math.max(1, usefulLifeYears);
+  const annualDepreciation = (assetCost - salvageValue) / safeLife;
+
+  for (let yr = 1; yr <= safeLife; yr++) {
+    const rIdx = originRow + yr + 1;
+    const firstDataRow = originRow + 2;
 
     matrix.push([
       yr,
-      yr === 1 ? assetCost : `=E${rIdx - 1}`,
-      depreciationMethod === 'SLN' ? Number(annualDepreciation.toFixed(2)) : `=DB(${assetCost}, ${salvageValue}, ${usefulLifeYears}, ${yr})`,
-      `=SUM($C$2:C${rIdx})`,
-      `=$B$2-D${rIdx}`,
+      yr === 1 ? assetCost : `=${colE}${rIdx - 1}`,
+      depreciationMethod === 'SLN'
+        ? Number(annualDepreciation.toFixed(2))
+        : `=DB(${assetCost}, ${salvageValue}, ${safeLife}, ${yr})`,
+      `=SUM($${colC}$${firstDataRow}:${colC}${rIdx})`,
+      `=$${colB}$${firstDataRow}-${colD}${rIdx}`,
     ]);
   }
 
-  destSheet.getRange(0, 0, 1, headers.length)?.setValues?.([headers]);
-  destSheet.getRange(1, 0, matrix.length, headers.length)?.setValues?.(matrix);
+  ensureSheetCapacity(destSheet, originRow + matrix.length + 3, originCol + headers.length + 1);
+  destSheet.getRange(originRow, originCol, 1, headers.length)?.setValues?.([headers]);
+  destSheet.getRange(originRow + 1, originCol, matrix.length, headers.length)?.setValues?.(matrix);
 
   return {
+    status: 'SUCCESS',
     success: true,
     action: 'generate_financial_model',
     modelType: 'depreciation',
     outputSheet: destSheetName,
-    message: `Generated ${usefulLifeYears}-year ${depreciationMethod} depreciation schedule.`,
+    message: `Generated ${safeLife}-year ${depreciationMethod} depreciation schedule.`,
   };
 }
 
 /**
- * 4. CASCADE DYNAMIC ARRAYS (UNIQUE, FILTER, SORT with #SPILL! Collision Guard)
+ * 4. CASCADE DYNAMIC ARRAYS (UNIQUE, FILTER, SORT with Safe #SPILL! Collision Guard)
  */
 export async function executeCascadeDynamicArrays(
   args: {
@@ -572,15 +574,24 @@ export async function executeCascadeDynamicArrays(
     formula = `=SEQUENCE(${sequenceRows}, ${sequenceCols}, ${sequenceStart}, ${sequenceStep})`;
   }
 
-  // Pre-check spill collision: ensure cells around target are clear
+  // Pre-check spill collision: only clear the exact number of columns required (1 column for 1D UNIQUE/SORT!)
   if (clearSpillZoneFirst) {
     const targetRangeObj = sheet.getRange(targetCell);
-    const startRow = typeof targetRangeObj.getRow === 'function' ? targetRangeObj.getRow() : 0;
-    const startCol = typeof targetRangeObj.getColumn === 'function' ? targetRangeObj.getColumn() : 0;
+    const startRow = typeof targetRangeObj?.getRow === 'function' ? targetRangeObj.getRow() : 0;
+    const startCol = typeof targetRangeObj?.getColumn === 'function' ? targetRangeObj.getColumn() : 0;
 
-    // Clear 15 rows below target to prevent #SPILL!
+    let spillCols = 1;
+    if (formulaType === 'SEQUENCE') {
+      spillCols = Math.max(1, sequenceCols);
+    } else if (sourceRangeA1) {
+      const srcRange = sheet.getRange(sourceRangeA1);
+      if (srcRange && typeof srcRange.getLastColumn === 'function' && typeof srcRange.getColumn === 'function') {
+        spillCols = Math.max(1, srcRange.getLastColumn() - srcRange.getColumn() + 1);
+      }
+    }
+
     try {
-      sheet.getRange(startRow + 1, startCol, 15, 5)?.clear?.();
+      sheet.getRange(startRow + 1, startCol, 15, spillCols)?.clear?.();
     } catch {
       // ignore
     }
@@ -592,6 +603,7 @@ export async function executeCascadeDynamicArrays(
   const durationMs = Math.round(performance.now() - t0);
 
   return {
+    status: verifyReceipt.status,
     success: verifyReceipt.status === 'SUCCESS',
     action: 'cascade_dynamic_arrays',
     formula,
@@ -610,7 +622,7 @@ export async function executeMatrixMathEngine(
     operation: 'running_total' | 'percent_of_total' | 'moving_average' | 'trend_slope_intercept';
     sourceColumn: string;
     targetColumn?: string;
-    windowSize?: number; // for moving average (default 7)
+    windowSize?: number;
     startRow?: number;
     endRow?: number;
     sheetName?: string;
@@ -635,16 +647,17 @@ export async function executeMatrixMathEngine(
   if (!sheet) throw new Error(`Worksheet ${sheetName || 'active'} not found`);
 
   const srcCol = resolveSheetColumn(sheet, sourceColumn, 0);
-  const destCol = targetColumn ? resolveSheetColumn(sheet, targetColumn, 0) : resolveSheetColumn(sheet, srcCol.colIndex + 1, 0);
+  const destCol = targetColumn
+    ? resolveSheetColumn(sheet, targetColumn, 0)
+    : resolveSheetColumn(sheet, srcCol.colIndex + 1, 0);
 
   const lastSheetRow = Math.max((sheet.getLastRow?.() ?? 0) + 1, 1);
   const effectiveEndRow = endRow ? Math.min(endRow, lastSheetRow) : lastSheetRow;
 
   if (effectiveEndRow < startRow) {
-    return { success: true, rowsWritten: 0, message: 'No rows to calculate' };
+    return { status: 'SUCCESS', success: true, rowsWritten: 0, message: 'No rows to calculate' };
   }
 
-  // Insert target column if needed
   if (!targetColumn) {
     sheet.insertColumns?.(destCol.colIndex, 1);
   }
@@ -678,12 +691,8 @@ export async function executeMatrixMathEngine(
     }
   }
 
-  // Write header at row 0
-  destSheetHeaderWrite: {
-    sheet.getRange(0, destCol.colIndex, 1, 1)?.setValues?.([[headerTitle]]);
-  }
+  sheet.getRange(0, destCol.colIndex, 1, 1)?.setValues?.([[headerTitle]]);
 
-  // Write formulas across rows
   const writeRange = `${destCol.colLetter}${startRow}:${destCol.colLetter}${effectiveEndRow}`;
   sheet.getRange(writeRange)?.setValues?.(formulas);
 
@@ -691,6 +700,7 @@ export async function executeMatrixMathEngine(
   const durationMs = Math.round(performance.now() - t0);
 
   return {
+    status: verifyReceipt.status,
     success: verifyReceipt.status === 'SUCCESS',
     action: 'matrix_math_engine',
     operation,
@@ -705,7 +715,9 @@ export async function executeMatrixMathEngine(
 }
 
 /**
- * 6. VALIDATE AND HEAL FORMULAS (The Formula Doctor & Self-Repair Sandbox)
+ * 6. VALIDATE AND HEAL FORMULAS (The Formula Doctor & Root-Cause Self-Repair Sandbox)
+ * Repairs unquoted sheet names ("Q1 Sales!A1" -> "'Q1 Sales'!A1"), common function typos,
+ * and division-by-zero risks before wrapping with protective IFERROR guards.
  */
 export async function executeValidateAndHealFormulas(
   args: {
@@ -739,8 +751,17 @@ export async function executeValidateAndHealFormulas(
     formulas = [];
   }
 
+  const allSheetNames: string[] = (wb.getSheets?.() || []).map(
+    (s: any) => s.getSheetName?.() || s.getName?.() || ''
+  );
+
   const ERROR_TOKENS = new Set(['#REF!', '#NAME?', '#VALUE!', '#DIV/0!', '#N/A', '#ERROR!', '#NUM!', '#NULL!']);
-  const healedFormulas: Array<{ coordinate: string; oldFormula: string; newFormula: string; errorFound: string }> = [];
+  const healedFormulas: Array<{
+    coordinate: string;
+    oldFormula: string;
+    newFormula: string;
+    errorFound: string;
+  }> = [];
 
   const updatedFormulasMatrix: any[][] = [];
 
@@ -759,8 +780,26 @@ export async function executeValidateAndHealFormulas(
         if (ERROR_TOKENS.has(valStr)) {
           let healed = cellFormula;
 
-          // Repair 1: Wrap with IFERROR if not already wrapped
-          if (autoWrapWithIfError && !healed.toUpperCase().startsWith('=IFERROR(') && !healed.toUpperCase().startsWith('=IFNA(')) {
+          // Root-Cause Repair 1: Quote unquoted sheet names with spaces (e.g. Q1 Sales!A2 -> 'Q1 Sales'!A2)
+          for (const sName of allSheetNames) {
+            if (sName.includes(' ') && healed.includes(`${sName}!`) && !healed.includes(`'${sName}'!`)) {
+              healed = healed.split(`${sName}!`).join(`'${sName.replace(/'/g, "''")}'!`);
+            }
+          }
+
+          // Root-Cause Repair 2: Fix common Excel function name typos (#NAME?)
+          healed = healed
+            .replace(/\bAVERGAGE\(/gi, 'AVERAGE(')
+            .replace(/\bSUMIFSS\(/gi, 'SUMIFS(')
+            .replace(/\bVLOOKP\(/gi, 'VLOOKUP(')
+            .replace(/\bXLOOKP\(/gi, 'XLOOKUP(');
+
+          // Protective Repair 3: Wrap with IFERROR if still vulnerable
+          if (
+            autoWrapWithIfError &&
+            !healed.toUpperCase().startsWith('=IFERROR(') &&
+            !healed.toUpperCase().startsWith('=IFNA(')
+          ) {
             const inner = healed.slice(1);
             const fallbackStr = typeof ifErrorFallback === 'number' ? ifErrorFallback : `"${ifErrorFallback}"`;
             healed = `=IFERROR(${inner}, ${fallbackStr})`;
@@ -784,26 +823,22 @@ export async function executeValidateAndHealFormulas(
     updatedFormulasMatrix.push(newRowForms);
   }
 
-  // Write healed formulas back if any were fixed
   if (healedFormulas.length > 0) {
     fRange.setValues(updatedFormulasMatrix);
   }
 
-  // Post verification pass
   const postVerify = await verifyRangeMutation(sheet, rangeA1);
   const durationMs = Math.round(performance.now() - t0);
 
   return {
+    status: postVerify.status,
     success: true,
     action: 'validate_and_heal_formulas',
     scannedRange: rangeA1,
     errorsFound: healedFormulas.length,
     healedFormulas,
-    remainingErrors: postVerify.errorCount,
+    postVerification: postVerify,
     durationMs,
-    message:
-      healedFormulas.length > 0
-        ? `Successfully diagnosed and healed ${healedFormulas.length} broken formula(s) in ${rangeA1} in ${durationMs}ms.`
-        : `Range ${rangeA1} is clean with zero formula calculation errors.`,
+    message: `Scanned ${rangeA1} and healed ${healedFormulas.length} broken formula(s) in ${durationMs}ms.`,
   };
 }

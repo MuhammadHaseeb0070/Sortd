@@ -38,3 +38,14 @@ body {
 ::-webkit-scrollbar-thumb:hover {
   background: #94a3b8;
 }
+
+/* Ensure text selection works reliably and looks polished across the workspace & chat */
+.select-text {
+  user-select: text !important;
+  -webkit-user-select: text !important;
+}
+
+::selection {
+  background-color: #d1fae5;
+  color: #064e3b;
+}

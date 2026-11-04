@@ -75,6 +75,7 @@ export async function POST(req: NextRequest) {
     const response = await fetch(endpoint, {
       method: 'POST',
       headers,
+      signal: req.signal,
       body: JSON.stringify(payload),
     });
 
@@ -107,6 +108,9 @@ export async function POST(req: NextRequest) {
       usage: completion.usage,
     });
   } catch (error: any) {
+    if (error?.name === 'AbortError') {
+      return NextResponse.json({ error: 'Request aborted by user.' }, { status: 499 });
+    }
     console.error('API /api/chat error:', error);
     return NextResponse.json(
       { error: error?.message || 'Internal server error in chat orchestrator.' },
